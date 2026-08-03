@@ -33,20 +33,10 @@ class SendPostBlastEmailsJob
 
     cache = {}
     @members.each_slice(recipients_slice_size) do |members_slice|
-      members = store_recipients_as_sent(members_slice)
-      recipients = prepare_recipients(members)
-
-      begin
-        PostEmailApi.process(post: @post, recipients:, cache:, blast: @blast)
-        mark_members_sent_in_this_blast(members) if @blast.to_non_openers?
-      rescue => e
-        # Delete the sent_post_emails records if there's an error with PostEmailApi.process
-        # We cannot use `transaction` here because it exceeds the lock timeout.
-        unless @blast.to_non_openers?
-          emails = members.map(&:email)
-          SentPostEmail.where(post: @post, email: emails).delete_all
+      members_slice.group_by { PostEmailApi.provider_for(post: @post, email: _1.email) }.each do |provider, provider_members|
+        provider_members.each_slice(PostEmailApi.max_recipients_for(provider)) do |provider_members_slice|
+          send_provider_slice(provider: provider, members: provider_members_slice, cache: cache)
         end
-        raise e
       end
     end
 
@@ -77,6 +67,74 @@ class SendPostBlastEmailsJob
 
     # Redis list/set writes only — no SQL — so this can stay large.
     REDIS_WRITE_SLICE_SIZE = 10_000
+
+    # A DNS or connect blip reaching the ESP lasts seconds, but raising it out of the
+    # provider slice loop costs an attempt at the WHOLE blast — and `retry: 10` spans
+    # roughly a day, so a resolver that flaps a few times in that window burns every
+    # attempt and the blast dead-sets partway through.
+    #
+    # Retrying in place is safe because the provider slice is the unit the error path
+    # below already reasons about: its SentPostEmail rows survive until the retries are
+    # exhausted, and the ESP call is the last thing in the slice, so a retry re-sends
+    # exactly these recipients. Only connection-establishment errors qualify — an ESP
+    # that rejected the payload will reject it again, so those raise straight through to
+    # Sidekiq's retry.
+    SLICE_DELIVERY_ATTEMPTS = 4
+    SLICE_DELIVERY_BACKOFF = [2, 8, 30].freeze
+    TRANSIENT_DELIVERY_ERRORS = [
+      Socket::ResolutionError,
+      Errno::ECONNREFUSED,
+      Errno::ECONNRESET,
+      Errno::EHOSTUNREACH,
+      Errno::ETIMEDOUT,
+      Net::OpenTimeout,
+      Net::ReadTimeout,
+    ].freeze
+
+    def send_provider_slice(provider:, members:, cache:)
+      members = store_recipients_as_sent(members)
+      recipients = prepare_recipients(members)
+
+      begin
+        deliver_slice_with_retries(provider: provider, recipients: recipients, cache: cache)
+        mark_members_sent_in_this_blast(members) if @blast.to_non_openers?
+      rescue => e
+        # Delete the sent_post_emails records if there's an error with the provider send.
+        # We cannot use `transaction` here because it exceeds the lock timeout.
+        unless @blast.to_non_openers?
+          emails = members.map(&:email)
+          SentPostEmail.where(post: @post, email: emails).delete_all
+        end
+        raise e
+      end
+    end
+
+    def deliver_slice_with_retries(provider:, recipients:, cache:)
+      attempt = 0
+      begin
+        attempt += 1
+        deliver_provider_slice(provider: provider, recipients: recipients, cache: cache)
+      rescue *TRANSIENT_DELIVERY_ERRORS => e
+        raise e if attempt >= SLICE_DELIVERY_ATTEMPTS
+
+        Rails.logger.info(
+          "[#{self.class.name}] blast_id=#{@blast.id} transient delivery error on attempt #{attempt} " \
+          "(#{e.class}: #{e.message}), retrying provider slice of #{recipients.size}")
+        sleep(SLICE_DELIVERY_BACKOFF[attempt - 1])
+        retry
+      end
+    end
+
+    def deliver_provider_slice(provider:, recipients:, cache:)
+      case provider
+      when MailerInfo::EMAIL_PROVIDER_RESEND
+        PostResendApi.process(post: @post, recipients: recipients, cache: cache, blast: @blast)
+      when MailerInfo::EMAIL_PROVIDER_SENDGRID
+        PostSendgridApi.process(post: @post, recipients: recipients, cache: cache, blast: @blast)
+      else
+        raise ArgumentError, "Unknown email provider: #{provider}"
+      end
+    end
 
     # Loads the recipient list for the blast. For sellers with very large audiences
     # (hundreds of thousands of members) the filter query is the slowest, most fragile
@@ -315,7 +373,7 @@ class SendPostBlastEmailsJob
             subscription_id: specifics[:subscription]&.id,
             link_id: specifics[:product_id],
           },
-          member:
+          member: member
         }
       end
 
