@@ -672,7 +672,8 @@ describe CheckoutController, type: :controller, inertia: true do
               quantity: 1,
               rent: false,
               referrer: "direct",
-              url_parameters: {}
+              url_parameters: {},
+              accepted_offer: nil
             }],
             discountCodes: []
           }
