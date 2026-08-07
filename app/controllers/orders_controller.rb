@@ -445,10 +445,18 @@ class OrdersController < ApplicationController
     end
 
     def all_free_products_without_captcha?
-      line_items = params.fetch(:line_items, {})
+      # An absent/blank :line_items must NOT earn the free-cart exemption — a vacuous
+      # Array#all? would let a cartless request skip reCAPTCHA entirely. It also must not
+      # 500: the old {} default handed #all? a bare ActionController::Parameters
+      # (GUMROAD-7B).
+      line_items = params.fetch(:line_items, [])
+      return false if line_items.blank?
+
       line_items.all? do |product|
         product_link = Link.find_by(unique_permalink: product["permalink"])
-        !product_link.require_captcha? && product["perceived_price_cents"].to_s == "0"
+        # A bogus permalink must fail the exemption, not 500 — and not pass it either:
+        # `!product_link&.require_captcha?` would read `!nil` as captcha-free.
+        product_link.present? && !product_link.require_captcha? && product["perceived_price_cents"].to_s == "0"
       end
     end
 
@@ -466,9 +474,13 @@ class OrdersController < ApplicationController
         :friend, :locale, :plugins, :save_card, :card_data_handling_mode, :card_data_handling_error,
         :card_country, :card_country_source, :wallet_type, :payment_details_source, :cc_zipcode, :vat_id, :email, :tax_country_election,
         :save_shipping_address, :card_expiry_month, :card_expiry_year, :stripe_status, :visual,
-        :billing_agreement_id, :paypal_order_id, :stripe_payment_method_id, :stripe_customer_id, :stripe_setup_intent_id, :stripe_error,
+        :billing_agreement_id, :paypal_order_id, :stripe_payment_method_id, :stripe_customer_id, :stripe_setup_intent_id,
         :braintree_transient_customer_store_key, :braintree_device_data, :use_existing_card, :paymentToken,
         :url_parameters, :is_gift, :giftee_email, :giftee_id, :gift_note, :referrer, :buyer_currency_quote,
+        # The browser reports a client-side tokenization/setup failure (e.g. a failed 3DS on the
+        # setup-intent lane) as a hash; permitting it as a scalar silently dropped it and every
+        # such failure surfaced as the generic CREDIT_CARD_NOT_PROVIDED decline copy.
+        stripe_error: [:type, :message, :code, :charge, :decline_code],
         purchase: [:full_name, :street_address, :city, :state, :zip_code, :country],
         # Individual purchase params
         line_items: [:uid, :permalink, :perceived_price_cents, :price_range, :discount_code, :is_preorder, :quantity, :call_start_time,

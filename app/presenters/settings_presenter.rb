@@ -630,11 +630,14 @@ class SettingsPresenter
     end
 
     def user_details(user_compliance_info)
+      # Memoize: evaluated for both need_full_ssn and has_outstanding_full_ssn_requirement below,
+      # and each call re-queries — a second query could see a request marked provided in between.
+      outstanding_full_ssn_requirement = has_outstanding_full_ssn_requirement?
       {
         country_supports_native_payouts: seller.native_payouts_supported?,
         no_payout_rail_in_country: seller.no_payout_rail_in_compliance_country?,
         country_supports_iban: seller.country_supports_iban?,
-        need_full_ssn: seller.has_ever_been_requested_for_user_compliance_info_field?(UserComplianceInfoFields::Individual::TAX_ID),
+        need_full_ssn: outstanding_full_ssn_requirement,
         country_code: user_compliance_info.legal_entity_country_code,
         payout_currency: Country.new(user_compliance_info.legal_entity_country_code).payout_currency,
         is_from_europe: seller.signed_up_from_europe?,
@@ -660,6 +663,8 @@ class SettingsPresenter
                                              Compliance::Countries::PAK.alpha2],
         individual_tax_id_entered: user_compliance_info.individual_tax_id.present?,
         individual_tax_id_last_four: tax_id_last_four(user_compliance_info.individual_tax_id),
+        individual_tax_id_is_last_four: tax_id_is_last_four_only?(user_compliance_info.individual_tax_id),
+        has_outstanding_full_ssn_requirement: outstanding_full_ssn_requirement,
         business_tax_id_entered: user_compliance_info.business_tax_id.present?,
         business_tax_id_last_four: tax_id_last_four(user_compliance_info.business_tax_id),
         requires_credit_card: seller.requires_credit_card?,
@@ -679,6 +684,27 @@ class SettingsPresenter
       return nil if encrypted_tax_id.blank?
       decrypted = encrypted_tax_id.decrypt(GlobalConfig.get("STRONGBOX_GENERAL_PASSWORD")).to_s
       decrypted.force_encoding(Encoding::UTF_8).scrub("").gsub(/[[:space:]]/, "")[-4..]
+    end
+
+    # Only an OUTSTANDING full (not partial/ssn_last_4) TAX_ID request should force re-entry.
+    # `has_ever_been_requested_...` is ever-based, so a seller who long ago cleared id_number via
+    # document upload (last-4 still on file) would otherwise be forced to re-enter an SSN Stripe
+    # no longer wants — on every payments-form save, forever.
+    def has_outstanding_full_ssn_requirement?
+      seller.user_compliance_info_requests
+            .requested
+            .where(field_needed: UserComplianceInfoFields::Individual::TAX_ID)
+            .only_needs_field_to_be_partially_provided(false)
+            .exists?
+    end
+
+    # Stripe can require a full 9-digit SSN (individual.id_number) after onboarding, but sellers
+    # who signed up when only ssn_last_4 was collected have just 4 digits on file — the sync job
+    # can never satisfy the requirement, so the UI must force re-entry.
+    def tax_id_is_last_four_only?(encrypted_tax_id)
+      return false if encrypted_tax_id.blank?
+      decrypted = encrypted_tax_id.decrypt(GlobalConfig.get("STRONGBOX_GENERAL_PASSWORD")).to_s
+      decrypted.force_encoding(Encoding::UTF_8).scrub("").gsub(/\D/, "").length == 4
     end
 
     def compliance_info_details(user_compliance_info)

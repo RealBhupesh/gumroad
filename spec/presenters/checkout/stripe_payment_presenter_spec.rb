@@ -40,6 +40,7 @@ describe Checkout::StripePaymentPresenter do
         # The product's own pricing currency, mirroring CheckoutPresenter#product_common,
         # which sets currency_code on every real add_products entry.
         currency_code: product.price_currency_type.to_s.downcase,
+        require_shipping: product.require_shipping?,
         installment_plan: product.installment_plan.present? ? {
           number_of_installments: product.installment_plan.number_of_installments,
           recurrence: product.installment_plan.recurrence,
@@ -76,10 +77,11 @@ describe Checkout::StripePaymentPresenter do
   # The Element's Link toggle and the intent's method list derive from the same resolver output, so
   # they move together; Link is always launched, and the US-locked methods (cashapp/us_bank_account)
   # are passed explicitly by the region-gate specs.
-  def payment_element_client_confirm_props(stripe_link_enabled: true, payment_method_types: %w[card link], stripe_connect_account_id: nil, currency: "usd", presentment_amount_cents: nil, listed_currency_display: nil, direct_listed_card: false, disable_wallets: false, request_apple_pay_merchant_tokens: false, payment_element_wallets: false, flat_payment_methods: payment_element_wallets || disable_wallets)
+  def payment_element_client_confirm_props(stripe_link_enabled: true, payment_method_types: %w[card link], stripe_connect_account_id: nil, currency: "usd", presentment_amount_cents: nil, listed_currency_display: nil, recurring_upi_registration: false, direct_listed_card: false, disable_wallets: false, request_apple_pay_merchant_tokens: false, payment_element_wallets: false, flat_payment_methods: payment_element_wallets || disable_wallets)
     {
       integration: described_class::STRIPE_PAYMENT_ELEMENT_CLIENT_CONFIRM_INTEGRATION,
       fallback_reason: nil,
+      recurring_upi_registration:,
       disable_wallets:,
       request_apple_pay_merchant_tokens:,
       payment_element_wallets:,
@@ -448,6 +450,38 @@ describe Checkout::StripePaymentPresenter do
     Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, seller) if seller
   end
 
+  it "mounts the buyer-currency element for a buyer who picked pay-in-installments on a presentment candidate" do
+    seller = create(:user, disable_buyer_local_currency: false)
+    product = create(:product, user: seller, price_cents: 1234)
+    create(:product_installment_plan, link: product)
+    allow(Stripe).to receive(:api_key).and_return("sk_test_currency")
+    Feature.activate_user(described_class::STRIPE_PAYMENT_ELEMENT_CHECKOUT_FEATURE_NAME, seller)
+    Feature.activate_user(:buyer_local_currency, seller)
+    Feature.activate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, seller)
+    add_products = [
+      checkout_product_for(
+        product,
+        pay_in_installments: true,
+        buyer_currency_display: {
+          display_mode: "buyer_local",
+          buyer_currency_shown: Currency::CAD,
+        }
+      )
+    ]
+
+    expect(stripe_payment_props(add_products:)).to eq(
+      payment_element_props(buyer_currency_presentment: true, disable_wallets: true)
+    )
+  ensure
+    Feature.deactivate_user(:buyer_local_currency, seller) if seller
+    Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, seller) if seller
+  end
+
+  it "mounts the canonical USD element for a buyer who picked pay-in-installments when the cart is not a presentment candidate" do
+    expect(stripe_payment_props(add_products: [flagged_seller_product(pay_in_installments: true)]))
+      .to eq(payment_element_props)
+  end
+
   it "mounts the buyer-currency element for a recurring presentment candidate" do
     seller = create(:user, disable_buyer_local_currency: false)
     product = create(:membership_product, user: seller, price_cents: 1234)
@@ -632,11 +666,6 @@ describe Checkout::StripePaymentPresenter do
   it "selects Stripe Payment Element for a commission product" do
     expect(stripe_payment_props(add_products: [flagged_seller_product(native_type: Link::NATIVE_TYPE_COMMISSION)]))
       .to eq(payment_element_props)
-  end
-
-  it "falls back to CardElement for an installment-plan product" do
-    expect(stripe_payment_props(add_products: [flagged_seller_product(pay_in_installments: true)]))
-      .to eq(card_element_fallback("setup_or_installment_flow"))
   end
 
   it "selects Stripe Payment Element SetupIntent mode for a preorder product" do
@@ -1146,6 +1175,12 @@ describe Checkout::StripePaymentPresenter do
         .to eq(payment_element_client_confirm_props)
     end
 
+    it "keeps an installment cart on the server-confirm element even with both flags" do
+      # A deferred ConfirmationToken cannot fund later off-session installments.
+      expect(stripe_payment_props(add_products: [confirm_flagged_seller_product(pay_in_installments: true)]))
+        .to eq(payment_element_props)
+    end
+
     it "launches Cash App Pay alongside card for a US buyer — ACH Direct Debit stays withdrawn platform-wide" do
       stub_geoip_country("104.28.0.1", "United States")
 
@@ -1535,6 +1570,40 @@ describe Checkout::StripePaymentPresenter do
       deactivate_buyer_currency_flags(seller) if seller
     end
 
+    it "kicks a mixed candidate/installment cart to CardElement instead of client-confirm, which cannot charge an installment purchase" do
+      # A mixed cart cannot be quoted, and installments keep method-forced client-confirm closed.
+      seller, product = buyer_currency_seller_with_product(price_cents: 1500)
+      installment_product = create(:product, user: seller, price_currency_type: "eur", price_cents: 3000)
+      create(:product_installment_plan, link: installment_product)
+      activate_buyer_currency_flags(seller)
+      allow(Stripe).to receive(:api_key).and_return("sk_test_currency")
+      platform_merchant_account
+      add_products = [
+        checkout_product_for(
+          product,
+          buyer_currency_display: {
+            display_mode: "buyer_local",
+            buyer_currency_shown: Currency::CAD,
+          }
+        ),
+        checkout_product_for(
+          installment_product,
+          pay_in_installments: true,
+          buyer_currency_display: {
+            display_mode: "default",
+            buyer_currency_shown: Currency::EUR,
+          }
+        )
+      ]
+
+      # disable_wallets: the fallback keeps the candidate cart's PRB suppression, matching the
+      # buyer-currency element it would otherwise mount.
+      expect(stripe_payment_props(add_products:))
+        .to eq(card_element_fallback("buyer_currency_presentment_unsupported").merge(disable_wallets: true))
+    ensure
+      deactivate_buyer_currency_flags(seller) if seller
+    end
+
     it "never mounts the client-confirm element for a cart Checkout::BuyerCurrencyQuote would really quote" do
       # The two examples above pin the routing against a hand-written expectation of which carts
       # get quoted. This one asserts the underlying rule against the quote service ITSELF, so the
@@ -1693,6 +1762,126 @@ describe Checkout::StripePaymentPresenter do
     ensure
       if seller
         Feature.deactivate_user(:checkout_local_method_upi, seller)
+        deactivate_buyer_currency_flags(seller)
+      end
+    end
+
+    it "mounts card + UPI for the flagged single paid-upfront INR membership slice" do
+      seller = create(:user, disable_buyer_local_currency: false)
+      product = create(:membership_product, user: seller, price_currency_type: Currency::INR, price_cents: 73_000)
+      # Deliberately no STRIPE_PAYMENT_ELEMENT_CHECKOUT flag: the UPI Autopay registration
+      # shape must survive a base-flag ramp-down (CardElement cannot mount UPI), so this
+      # example pins that the shape skips the flag-gated CardElement fallback.
+      Feature.activate_user(described_class::STRIPE_PAYMENT_ELEMENT_CLIENT_CONFIRM_FEATURE_NAME, seller)
+      activate_buyer_currency_flags(seller)
+      Feature.activate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller)
+      Feature.activate_user(:checkout_local_method_upi, seller)
+      Feature.activate(Checkout::PaymentMethodResolver::UPI_RECURRING_SERVICING_FEATURE)
+      Feature.activate_user(Checkout::PaymentMethodResolver::UPI_RECURRING_LAUNCH_FEATURE, seller)
+      allow(Stripe).to receive(:api_key).and_return("sk_live_currency")
+      stub_geoip_country("203.0.113.13", "India")
+
+      props = stripe_payment_props(
+        # Membership products keep their price on tiers, so pass the selected tier price just
+        # as the real checkout payload does.
+        add_products: [checkout_product_for(product, price: 73_000, recurrence: BasePrice::Recurrence::MONTHLY)],
+        ip: "203.0.113.13"
+      )
+
+      expect(props).to eq(
+        payment_element_client_confirm_props(
+          currency: Currency::INR,
+          presentment_amount_cents: 73_000,
+          payment_method_types: %w[card upi],
+          stripe_link_enabled: false,
+          recurring_upi_registration: true,
+          disable_wallets: true,
+        )
+      )
+    ensure
+      Feature.deactivate(Checkout::PaymentMethodResolver::UPI_RECURRING_SERVICING_FEATURE)
+      if seller
+        Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller)
+        Feature.deactivate_user(:checkout_local_method_upi, seller)
+        Feature.deactivate_user(Checkout::PaymentMethodResolver::UPI_RECURRING_LAUNCH_FEATURE, seller)
+        deactivate_buyer_currency_flags(seller)
+      end
+    end
+
+    it "keeps the CardElement fallback for the UPI membership shape when its client-confirm lane cannot mount" do
+      # The base-flag exemption above only applies to a cart that will actually take the UPI
+      # client-confirm lane; with the client-confirm flag off, the shape falls back like any
+      # other cart instead of mounting a Payment Element the seller's flags don't allow.
+      seller = create(:user, disable_buyer_local_currency: false)
+      product = create(:membership_product, user: seller, price_currency_type: Currency::INR, price_cents: 73_000)
+      activate_buyer_currency_flags(seller)
+      Feature.activate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller)
+      Feature.activate_user(:checkout_local_method_upi, seller)
+      Feature.activate(Checkout::PaymentMethodResolver::UPI_RECURRING_SERVICING_FEATURE)
+      Feature.activate_user(Checkout::PaymentMethodResolver::UPI_RECURRING_LAUNCH_FEATURE, seller)
+      allow(Stripe).to receive(:api_key).and_return("sk_live_currency")
+      stub_geoip_country("203.0.113.15", "India")
+
+      props = stripe_payment_props(
+        add_products: [checkout_product_for(product, price: 73_000, recurrence: BasePrice::Recurrence::MONTHLY)],
+        ip: "203.0.113.15"
+      )
+
+      expect(props).to eq(card_element_fallback("stripe_payment_element_flag_disabled"))
+    ensure
+      Feature.deactivate(Checkout::PaymentMethodResolver::UPI_RECURRING_SERVICING_FEATURE)
+      if seller
+        Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller)
+        Feature.deactivate_user(:checkout_local_method_upi, seller)
+        Feature.deactivate_user(Checkout::PaymentMethodResolver::UPI_RECURRING_LAUNCH_FEATURE, seller)
+        deactivate_buyer_currency_flags(seller)
+      end
+    end
+
+    it "keeps unsupported recurring shapes off the UPI Autopay registration lane" do
+      seller = create(:user, disable_buyer_local_currency: false)
+      product = create(:membership_product, user: seller, price_currency_type: Currency::INR, price_cents: 73_000)
+      Feature.activate_user(described_class::STRIPE_PAYMENT_ELEMENT_CLIENT_CONFIRM_FEATURE_NAME, seller)
+      activate_buyer_currency_flags(seller)
+      Feature.activate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller)
+      Feature.activate_user(:checkout_local_method_upi, seller)
+      Feature.activate(Checkout::PaymentMethodResolver::UPI_RECURRING_SERVICING_FEATURE)
+      Feature.activate_user(Checkout::PaymentMethodResolver::UPI_RECURRING_LAUNCH_FEATURE, seller)
+      allow(Stripe).to receive(:api_key).and_return("sk_live_currency")
+      stub_geoip_country("203.0.113.14", "India")
+
+      item = checkout_product_for(product, price: 73_000, recurrence: BasePrice::Recurrence::MONTHLY)
+      unsupported = {
+        multi_item: [item.deep_dup, item.deep_dup],
+        quantity: [item.deep_dup.tap { _1[:quantity] = 2 }],
+        installment: [item.deep_dup.tap { _1[:pay_in_installments] = true }],
+        offered_installment_plan: [item.deep_dup.tap { _1[:product][:installment_plan] = { number_of_installments: 2 } }],
+        preorder: [item.deep_dup.tap { _1[:product][:is_preorder] = true }],
+        free_trial: [item.deep_dup.tap { _1[:product][:free_trial] = { duration: { unit: "day", amount: 7 } } }],
+        physical: [item.deep_dup.tap { _1[:product][:require_shipping] = true }],
+        commission: [item.deep_dup.tap { _1[:product][:native_type] = Link::NATIVE_TYPE_COMMISSION }],
+      }
+
+      aggregate_failures do
+        unsupported.each do |shape, add_products|
+          props = stripe_payment_props(add_products:, ip: "203.0.113.14")
+
+          expect(props[:integration]).not_to eq(described_class::STRIPE_PAYMENT_ELEMENT_CLIENT_CONFIRM_INTEGRATION), shape.to_s
+          expect(Array(props.dig(:elements_options, :payment_method_types))).not_to include("upi"), shape.to_s
+        end
+
+        create(:merchant_account, user: seller)
+        seller.merchant_accounts.reset
+        props = stripe_payment_props(add_products: [item], ip: "203.0.113.14")
+        expect(props[:integration]).not_to eq(described_class::STRIPE_PAYMENT_ELEMENT_CLIENT_CONFIRM_INTEGRATION), "seller_merchant_account"
+        expect(Array(props.dig(:elements_options, :payment_method_types))).not_to include("upi"), "seller_merchant_account"
+      end
+    ensure
+      Feature.deactivate(Checkout::PaymentMethodResolver::UPI_RECURRING_SERVICING_FEATURE)
+      if seller
+        Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller)
+        Feature.deactivate_user(:checkout_local_method_upi, seller)
+        Feature.deactivate_user(Checkout::PaymentMethodResolver::UPI_RECURRING_LAUNCH_FEATURE, seller)
         deactivate_buyer_currency_flags(seller)
       end
     end
@@ -1935,8 +2124,9 @@ describe Checkout::StripePaymentPresenter do
     end
 
     it "mounts the buyer-currency element for a recurring EUR-priced presentment candidate instead of crashing" do
-      # A recurring cart is rejected by the payment method resolver (client-confirm only
-      # covers one-time purchases), so its resolution carries a nil method list. The
+      # A recurring cart is rejected by the payment method resolver (client-confirm covers
+      # one-time purchases and the UPI Autopay registration shape, which this EUR cart is
+      # not), so its resolution carries a nil method list. The
       # method-forced shape check — evaluated before the presentment shape in the supported
       # check — must consult the resolver's eligibility verdict before scanning the method
       # list, or this cart raises instead of mounting the element.
@@ -2009,15 +2199,15 @@ describe Checkout::StripePaymentPresenter do
     end
 
     it "requests merchant tokens on the CardElement fallback when the seller is flagged" do
-      # The wallet button renders on CardElement checkouts too (installment plans and other
+      # The wallet button renders on CardElement checkouts too (below-minimum carts and other
       # Payment Element fallbacks), so the flag must reach the frontend on every integration.
       seller = create(:user)
       product = create(:product, user: seller, price_cents: 1234)
       Feature.activate_user(described_class::STRIPE_PAYMENT_ELEMENT_CHECKOUT_FEATURE_NAME, seller)
       Feature.activate_user(described_class::APPLE_PAY_MERCHANT_TOKENS_FEATURE_NAME, seller)
 
-      expect(stripe_payment_props(add_products: [checkout_product_for(product, pay_in_installments: true)]))
-        .to eq(card_element_fallback("setup_or_installment_flow", request_apple_pay_merchant_tokens: true))
+      expect(stripe_payment_props(add_products: [checkout_product_for(product, price: described_class::STRIPE_PAYMENT_ELEMENT_MINIMUM_USD_CHARGE_CENTS - 1)]))
+        .to eq(card_element_fallback("stripe_payment_element_amount_below_minimum", request_apple_pay_merchant_tokens: true))
     end
 
     it "requests merchant tokens on the client-confirm integration when the seller is flagged" do
@@ -2078,15 +2268,16 @@ describe Checkout::StripePaymentPresenter do
     end
 
     it "never enables element wallets on the CardElement fallback, even when the seller is flagged" do
-      # CardElement carts (installment plans and other fallbacks) never mount a Payment Element,
-      # so there is no element wallet surface to enable — they keep the Payment Request Button.
+      # CardElement carts (below-minimum carts and other fallbacks) never mount a Payment
+      # Element, so there is no element wallet surface to enable — they keep the Payment
+      # Request Button.
       seller = create(:user)
       product = create(:product, user: seller, price_cents: 1234)
       Feature.activate_user(described_class::STRIPE_PAYMENT_ELEMENT_CHECKOUT_FEATURE_NAME, seller)
       Feature.activate_user(described_class::PAYMENT_ELEMENT_WALLETS_FEATURE_NAME, seller)
 
-      expect(stripe_payment_props(add_products: [checkout_product_for(product, pay_in_installments: true)]))
-        .to eq(card_element_fallback("setup_or_installment_flow"))
+      expect(stripe_payment_props(add_products: [checkout_product_for(product, price: described_class::STRIPE_PAYMENT_ELEMENT_MINIMUM_USD_CHARGE_CENTS - 1)]))
+        .to eq(card_element_fallback("stripe_payment_element_amount_below_minimum"))
     end
 
     it "keeps element wallets off when the cart disables wallets, even with the seller flagged" do

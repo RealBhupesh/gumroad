@@ -90,6 +90,7 @@ const cardElementConfig: CheckoutPaymentConfig = {
 const paymentElementClientConfirmConfig: CheckoutPaymentConfig = {
   integration: "payment_element_client_confirm",
   fallback_reason: null,
+  recurring_upi_registration: false,
   disable_wallets: false,
   request_apple_pay_merchant_tokens: false,
   payment_element_wallets: false,
@@ -101,6 +102,22 @@ const paymentElementClientConfirmConfig: CheckoutPaymentConfig = {
     listed_currency_display: null,
     payment_method_types: ["card"],
     payment_method_list_token: null,
+    stripe_link_enabled: false,
+    stripe_connect_account_id: null,
+  },
+};
+
+const recurringUpiPaymentElementClientConfirmConfig: CheckoutPaymentConfig = {
+  ...paymentElementClientConfirmConfig,
+  recurring_upi_registration: true,
+  disable_wallets: true,
+  flat_payment_methods: true,
+  elements_options: {
+    ...paymentElementClientConfirmConfig.elements_options,
+    currency: "inr",
+    presentment_amount_cents: 73_000,
+    listed_currency_display: { currency: "inr", subunit_to_unit: 100 },
+    payment_method_types: ["card", "upi"],
     stripe_link_enabled: false,
     stripe_connect_account_id: null,
   },
@@ -245,10 +262,45 @@ describe("canUseStripePaymentElement", () => {
     expect(canUseStripePaymentElement(state({ products: [product({ nativeType: "commission" })] }))).toBe(true);
   });
 
-  it("falls back for future-charge and installment flows in PaymentIntent mode", () => {
-    expect(canUseStripePaymentElement(state({ products: [product({ payInInstallments: true })] }))).toBe(false);
+  it("falls back for future-charge flows in PaymentIntent mode", () => {
     expect(canUseStripePaymentElement(state({ products: [product({ isPreorder: true })] }))).toBe(false);
     expect(canUseStripePaymentElement(state({ products: [product({ hasFreeTrial: true })] }))).toBe(false);
+  });
+
+  it("allows installments on the canonical USD server-confirm element", () => {
+    expect(canUseStripePaymentElement(state({ products: [product({ payInInstallments: true })] }))).toBe(true);
+  });
+
+  it("falls back when the server-owned first charge is below Stripe's minimum", () => {
+    // The agreement total plus full tax would clear the floor, but the actual first charge does not.
+    expect(
+      canUseStripePaymentElement(
+        state({
+          products: [product({ price: 120, payInInstallments: true, installmentPlan: { numberOfInstallments: 3 } })],
+          surcharges: loadedSurcharges({ subtotal: 120, tax_cents: 60, charge_canonical_total_cents: 48 }),
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("allows installments on the buyer-currency presentment lane, whose quote prices the first installment", () => {
+    expect(
+      canUseStripePaymentElement(
+        state({
+          checkoutPayment: buyerCurrencyPresentmentPaymentElementConfig,
+          products: [product({ payInInstallments: true })],
+        }),
+      ),
+    ).toBe(true);
+    // The lane does not admit the other future-charge shapes.
+    expect(
+      canUseStripePaymentElement(
+        state({
+          checkoutPayment: buyerCurrencyPresentmentPaymentElementConfig,
+          products: [product({ isPreorder: true })],
+        }),
+      ),
+    ).toBe(false);
   });
 
   it("allows setup-mode checkout for preorder and free-trial flows", () => {
@@ -410,6 +462,36 @@ describe("canUseStripePaymentElementClientConfirm", () => {
     expect(canUseStripePaymentElementClientConfirm(clientConfirmState())).toBe(true);
   });
 
+  it("allows the server-selected recurring UPI registration lane", () => {
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        clientConfirmState({
+          checkoutPayment: recurringUpiPaymentElementClientConfirmConfig,
+          products: [product({ recurrence: "monthly", listedPriceCents: 73_000 })],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps recurring UPI available when a limited discount changes only today's charge", () => {
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        clientConfirmState({
+          checkoutPayment: recurringUpiPaymentElementClientConfirmConfig,
+          products: [
+            product({
+              recurrence: "monthly",
+              // price is the discounted canonical amount charged today; listedPriceCents keeps
+              // the selected pre-discount INR basis that the server rendered.
+              price: 430,
+              listedPriceCents: 73_000,
+            }),
+          ],
+        }),
+      ),
+    ).toBe(true);
+  });
+
   it("falls back when the server selected the server-confirm Payment Element integration", () => {
     expect(canUseStripePaymentElementClientConfirm(state())).toBe(false);
   });
@@ -435,7 +517,7 @@ describe("canUseStripePaymentElementClientConfirm", () => {
     ).toBe(false);
   });
 
-  it("falls back for reusable-payment-method flows because client-confirm mode is one-time only", () => {
+  it("falls back for recurring and reusable-payment-method flows outside UPI registration", () => {
     expect(
       canUseStripePaymentElementClientConfirm(clientConfirmState({ products: [product({ recurrence: "monthly" })] })),
     ).toBe(false);
@@ -447,6 +529,72 @@ describe("canUseStripePaymentElementClientConfirm", () => {
     expect(
       canUseStripePaymentElementClientConfirm(
         clientConfirmState({ products: [product({ nativeType: "commission" })] }),
+      ),
+    ).toBe(false);
+  });
+
+  it("fails closed when recurring UPI configuration or the live cart no longer matches", () => {
+    const recurringProduct = product({ recurrence: "monthly", listedPriceCents: 73_000 });
+    const recurringUpiState = (overrides: Partial<State> = {}) =>
+      clientConfirmState({
+        checkoutPayment: recurringUpiPaymentElementClientConfirmConfig,
+        products: [recurringProduct],
+        ...overrides,
+      });
+
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        recurringUpiState({
+          checkoutPayment: {
+            ...recurringUpiPaymentElementClientConfirmConfig,
+            recurring_upi_registration: false,
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        recurringUpiState({
+          checkoutPayment: {
+            ...recurringUpiPaymentElementClientConfirmConfig,
+            elements_options: {
+              ...recurringUpiPaymentElementClientConfirmConfig.elements_options,
+              payment_method_types: ["card", "link", "upi"],
+            },
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        recurringUpiState({ products: [product({ recurrence: "monthly", quantity: 2 })] }),
+      ),
+    ).toBe(false);
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        recurringUpiState({ products: [product({ recurrence: "monthly", listedPriceCents: 74_000 })] }),
+      ),
+    ).toBe(false);
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        recurringUpiState({ products: [product({ recurrence: null, listedPriceCents: 73_000 })] }),
+      ),
+    ).toBe(false);
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        recurringUpiState({
+          products: [product({ recurrence: "monthly", installmentPlan: { numberOfInstallments: 2 } })],
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        recurringUpiState({ products: [product({ recurrence: "monthly", requireShipping: true })] }),
+      ),
+    ).toBe(false);
+    expect(
+      canUseStripePaymentElementClientConfirm(
+        recurringUpiState({ gift: { type: "normal", email: "recipient@example.com", note: "" } }),
       ),
     ).toBe(false);
   });
@@ -525,6 +673,9 @@ describe("requiresPaymentElementReusablePaymentMethod", () => {
         state({ products: [product(), product({ permalink: "commission", nativeType: "commission" })] }),
       ),
     ).toBe(true);
+    expect(
+      requiresPaymentElementReusablePaymentMethod(state({ products: [product({ payInInstallments: true })] })),
+    ).toBe(true);
   });
 });
 
@@ -592,6 +743,19 @@ describe("getStripePaymentElementAmount", () => {
 
   it("returns null until surcharges load", () => {
     expect(getStripePaymentElementAmount(state({ surcharges: { type: "pending" } }))).toBeNull();
+  });
+
+  it("returns the server-owned charge-now amount for a taxed installment cart", () => {
+    // This mirrors the request spec: $10 in three installments with 5.5% tax charges
+    // $3.34 + $0.18 today, while the full agreement is $10.55.
+    expect(
+      getStripePaymentElementAmount(
+        state({
+          products: [product({ price: 1_000, payInInstallments: true, installmentPlan: { numberOfInstallments: 3 } })],
+          surcharges: loadedSurcharges({ subtotal: 1_000, tax_cents: 55, charge_canonical_total_cents: 352 }),
+        }),
+      ),
+    ).toBe(352);
   });
 
   it("returns null for setup-mode checkout", () => {
@@ -766,13 +930,18 @@ describe("buyer-currency presentment lane", () => {
   it("mounts canonical USD when the surcharge response has no quote", () => {
     const s = state({
       checkoutPayment: buyerCurrencyPresentmentPaymentElementConfig,
+      products: [product({ payInInstallments: true, installmentPlan: { numberOfInstallments: 3 } })],
       surcharges: {
         type: "loaded",
-        result: { ...loadedSurchargesWithQuote.result, buyer_currency_quote: null },
+        result: {
+          ...loadedSurchargesWithQuote.result,
+          charge_canonical_total_cents: 352,
+          buyer_currency_quote: null,
+        },
       },
     });
     expect(getStripePaymentElementPresentment(s)).toBeNull();
-    expect(getStripePaymentElementAmount(s)).toBe(1_300);
+    expect(getStripePaymentElementAmount(s)).toBe(352);
   });
 
   it("mounts canonical USD when the quote allocation does not match the cart", () => {
@@ -801,11 +970,15 @@ describe("buyer-currency presentment lane", () => {
   it("mounts canonical USD when the buyer opts to save the card (canonical charge path)", () => {
     const s = state({
       checkoutPayment: buyerCurrencyPresentmentPaymentElementConfig,
-      surcharges: loadedSurchargesWithQuote,
+      products: [product({ payInInstallments: true, installmentPlan: { numberOfInstallments: 3 } })],
+      surcharges: {
+        ...loadedSurchargesWithQuote,
+        result: { ...loadedSurchargesWithQuote.result, charge_canonical_total_cents: 352 },
+      },
       willSaveCard: true,
     });
     expect(getStripePaymentElementPresentment(s)).toBeNull();
-    expect(getStripePaymentElementAmount(s)).toBe(1_300);
+    expect(getStripePaymentElementAmount(s)).toBe(352);
   });
 
   it("mounts canonical USD while a non-card payment method is selected", () => {
@@ -1721,7 +1894,12 @@ describe("reduceCheckoutState", () => {
 });
 
 const loadedSurcharges = (
-  overrides: Partial<{ subtotal: number; tax_cents: number; shipping_rate_cents: number }> = {},
+  overrides: Partial<{
+    subtotal: number;
+    tax_cents: number;
+    shipping_rate_cents: number;
+    charge_canonical_total_cents: number;
+  }> = {},
 ) =>
   ({
     type: "loaded",
@@ -1748,9 +1926,18 @@ describe("getChargeTodayPrice", () => {
     ).toBe(1_150);
   });
 
-  it("matches the checkout table's Payment today row for an installment cart", () => {
-    // $10 in 2 installments at 20% tax: the table presents the full tax with "Payment today"
-    // ($5 first installment + $2 tax = $7) and "Future installments" pre-tax ($5).
+  it("uses the server-owned amount for a taxed installment cart", () => {
+    expect(
+      getChargeTodayPrice(
+        state({
+          products: [product({ price: 1_000, payInInstallments: true, installmentPlan: { numberOfInstallments: 2 } })],
+          surcharges: loadedSurcharges({ subtotal: 1_000, tax_cents: 200, charge_canonical_total_cents: 600 }),
+        }),
+      ),
+    ).toBe(600);
+  });
+
+  it("falls back to the display-derived amount for an older surcharge response", () => {
     expect(
       getChargeTodayPrice(
         state({

@@ -110,18 +110,12 @@ class Purchase < ApplicationRecord
   # debit actually booked. Snapshotted at debit time so the dispute-won re-credit books
   # exactly the same amount, even when refunds land between the debit and the win.
   attr_json_data_accessor :presentment_dispute_debited_gross_cents
-  # Why `can_contact` is false. Until now the only way to tell a buyer's own unsubscribe from a
-  # machine-written suppression was `versions.request_path` being non-NULL, which is an audit
-  # side effect with a retention window — see antiwork/gumroad-private#1745, where a restore had
-  # to be reconstructed forensically and anything past retention was unrecoverable.
+  # Why `can_contact` is false. Only `BUYER_UNSUBSCRIBE`/`SPAM_REPORT` are first-party consent;
+  # a restore must never reverse those, only `INHERITED`.
   attr_json_data_accessor :can_contact_reason
 
-  # Buyer acted: clicked the receipt-footer unsubscribe, or reported the email as spam. Both are
-  # first-party consent signals and must never be reversed by an automated restore.
   CAN_CONTACT_REASON_BUYER_UNSUBSCRIBE = "buyer_unsubscribe"
   CAN_CONTACT_REASON_SPAM_REPORT = "spam_report"
-  # Nobody acted on THIS row: it was born uncontactable because a sibling already was.
-  # Reversing it is safe iff the row it inherited from is reversed.
   CAN_CONTACT_REASON_INHERITED = "inherited"
 
   alias_attribute :total_transaction_cents_usd, :total_transaction_cents
@@ -3734,8 +3728,10 @@ class Purchase < ApplicationRecord
     preorder.present? || is_recurring_subscription_charge
   end
 
-  def is_an_off_session_charge_on_indian_card?
-    stripe_charge_processor? && card_country == "IN" && is_a_saved_card_rebill?
+  def is_an_async_off_session_charge_in_india?
+    return false unless stripe_charge_processor? && is_a_saved_card_rebill?
+
+    credit_card&.recurring_upi? || (!credit_card&.upi? && card_country == Compliance::Countries::IND.alpha2)
   end
 
   # Indian cards must register an RBI e-mandate when a recurring payment is first set up;
@@ -3788,10 +3784,10 @@ class Purchase < ApplicationRecord
     ErrorNotifier.notify(e, purchase: external_id)
   end
 
-  # Off-session charges on Indian cards remain in processing for 26 hours on Stripe.
+  # Off-session charges on Indian cards and UPI remain in processing for 26 hours on Stripe.
   # We keep the purchase in_progress for that duration, so avoid forced updates (from admin or background jobs).
   def can_force_update?
-    in_progress? && (!is_an_off_session_charge_on_indian_card? || created_at < 26.hours.ago)
+    in_progress? && (!is_an_async_off_session_charge_in_india? || created_at < 26.hours.ago)
   end
 
   def linked_license
@@ -4504,8 +4500,13 @@ class Purchase < ApplicationRecord
     def prepare_merchant_account(charge_processor_id, resolved_merchant_account: nil)
       # Note: This assumes for the time being that all chargeables have only one internal chargeable.
       # Single-seller callers may pass a pre-resolved account to skip the per-purchase lookup.
-      self.merchant_account = resolved_merchant_account || seller.merchant_account(charge_processor_id)
-      self.merchant_account ||= MerchantAccount.gumroad(charge_processor_id)
+      self.merchant_account = if credit_card&.recurring_upi?
+        # UPI Autopay is enrolled on Gumroad's Stripe account; a seller connecting Stripe later
+        # must not move the saved Customer and PaymentMethod to an account that cannot see them.
+        MerchantAccount.gumroad(StripeChargeProcessor.charge_processor_id)
+      else
+        resolved_merchant_account || seller.merchant_account(charge_processor_id) || MerchantAccount.gumroad(charge_processor_id)
+      end
       if merchant_account&.is_a_brazilian_stripe_connect_account? && affiliate.present?
         self.error_code = PurchaseErrorCode::BRAZILIAN_MERCHANT_ACCOUNT_WITH_AFFILIATE
         errors.add(:base, "Affiliate sales are not currently supported for this product.")
@@ -4530,18 +4531,30 @@ class Purchase < ApplicationRecord
     end
 
     # Processor args for an off-session purchase whose buyer-currency price was fixed earlier.
-    # Buyer-present charges stay on the verified checkout quote path.
+    # UPI renewals require their stored INR terms; other rails retain the canonical-USD fallback.
     def later_charge_presentment_processor_args(off_session:)
       return {} unless off_session
-      return {} unless charge_processor_id == StripeChargeProcessor.charge_processor_id
-      return {} unless merchant_account&.stripe_charge_processor?
-      return {} unless Checkout::BuyerCurrencyEligibility.seller_enabled?(seller)
+
+      upi_autopay = credit_card&.recurring_upi?
+      if upi_autopay
+        if Feature.inactive?(Checkout::PaymentMethodResolver::UPI_RECURRING_SERVICING_FEATURE)
+          defer_upi_recurring_renewal!("servicing flag inactive")
+        end
+        fail_upi_recurring_authorization!("charge processor changed") unless charge_processor_id == StripeChargeProcessor.charge_processor_id
+        fail_upi_recurring_authorization!("merchant account changed") unless merchant_account&.stripe_charge_processor?
+        fail_upi_recurring_authorization!("purchase is not a subscription renewal") if subscription.blank? || is_original_subscription_purchase?
+      else
+        return {} unless charge_processor_id == StripeChargeProcessor.charge_processor_id
+        return {} unless merchant_account&.stripe_charge_processor?
+        return {} unless Checkout::BuyerCurrencyEligibility.seller_enabled?(seller)
+      end
 
       result = Purchase::LaterChargePresentmentService.new(
         merchant_account:,
         purchases: [self],
         amount_cents: total_transaction_cents,
-        gumroad_amount_cents: total_transaction_amount_for_gumroad_cents
+        gumroad_amount_cents: total_transaction_amount_for_gumroad_cents,
+        required_currency: (Currency::INR if upi_autopay)
       ).perform
       return {} if result.blank?
 
@@ -4551,6 +4564,19 @@ class Purchase < ApplicationRecord
         processor_gumroad_amount_cents: result.processor_gumroad_amount_cents,
         stripe_fx_quote_id: result.stripe_fx_quote_id,
       }
+    end
+
+    def fail_upi_recurring_authorization!(reason)
+      ErrorNotifier.notify("UPI Autopay renewal rejected before Stripe submit", reason:, purchase_id: id)
+      raise ChargeProcessorCardError.new(
+        PurchaseErrorCode::UPI_RECURRING_AUTHORIZATION_REQUIRED,
+        StripeChargeProcessor::UPI_PAYMENT_METHOD_UPDATE_MESSAGE
+      )
+    end
+
+    def defer_upi_recurring_renewal!(reason)
+      ErrorNotifier.notify("UPI Autopay renewal deferred before Stripe submit", reason:, purchase_id: id)
+      raise ChargeProcessorUnavailableError, "UPI Autopay renewals are temporarily paused"
     end
 
     # Converts the RBI e-mandate cap into the currency this charge will actually settle in. See

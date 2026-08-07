@@ -35,6 +35,7 @@ class RedisKey
     def sales_related_products_internal_limit = "sales_related_products_internal_limit"
     def recommended_products_associated_product_ids_limit = "recommended_products_associated_product_ids_limit"
     def blast_recipients_slice_size = "blast:recipients_slice_size"
+    def grouped_receipt_send_claim(email, digest) = "grouped_receipt_send_claim:#{Digest::SHA256.hexdigest(email.to_s.downcase)}:#{digest}"
     def blast_sent_emails(blast_id) = "blast:#{blast_id}:sent_emails"
     def blast_audience_snapshot(blast_id) = "blast:#{blast_id}:audience_snapshot"
     def blast_non_opener_emails(blast_id) = "blast:#{blast_id}:non_opener_emails"
@@ -60,8 +61,6 @@ class RedisKey
     def sales_report_jobs = "sales_report_jobs"
     def acme_challenge(token) = "acme_challenge:#{token}"
     def walks_app_attest_challenge(challenge) = "walks_app_attest_challenge:#{challenge}"
-    def unreviewed_users_data = "admin:unreviewed_users_data"
-    def unreviewed_users_cutoff_date = "admin:unreviewed_users_cutoff_date"
     def paypal_topup_needed = "paypal:topup_needed"
     # Set (with a TTL) by each weekly payout batch job while it runs, so the
     # deploy pipeline can ask "is a payout batch in flight right now?" instead
@@ -90,6 +89,9 @@ class RedisKey
     def stale_block_sweep_cursor = "stale_block_sweep:cursor"
     # High-water mark for RepairOrderChargeOutcomesJob's backlog pass: the last orders id it walked.
     def order_charge_outcome_repair_cursor = "order_charge_outcome_repair:cursor"
+    # Fixed at lap start so the walk keeps making forward progress even while new failing orders
+    # keep arriving above it. See RepairOrderChargeOutcomesJob.
+    def order_charge_outcome_repair_lap_ceiling = "order_charge_outcome_repair:lap_ceiling"
     # High-water mark for AlertOnStripeDobDriftJob: the last merchant_accounts id it compared.
     def stripe_dob_drift_sweep_cursor = "stripe_dob_drift_sweep:cursor"
     # Purchases whose notice was claimed but never transmitted. The cursor is already past their

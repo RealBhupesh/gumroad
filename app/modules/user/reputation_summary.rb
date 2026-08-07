@@ -1,9 +1,8 @@
 # frozen_string_literal: true
 
-# Seller-level rating rollup over per-product review stats, computed on read
-# (same maths as Link#bundle_rating_stats: sum the per-star counters, weight by
-# review count). Everything here is gated on the :seller_reputation_summary
-# Flipper flag via reputation_summary_enabled?.
+# Seller-level rating rollup over per-product review stats, computed on read:
+# sum the per-star counters, weight by review count. Everything here is gated on
+# the :seller_reputation_summary Flipper flag via reputation_summary_enabled?.
 module User::ReputationSummary
   # Below these the rollup reads as noise, not signal (gumroad-private#1669).
   # Product-owned numbers: change them in one line, not by redesign.
@@ -23,9 +22,10 @@ module User::ReputationSummary
     counts = Hash.new(0)
     products_count = 0
     # display_product_reviews is a Link flag bit, not a column, so opted-out
-    # products are rejected in Ruby rather than in SQL.
+    # products are rejected in Ruby rather than in SQL. Link.alive alone
+    # does not exclude drafts, hence not_draft.
     stats = ProductReviewStat.joins(:link)
-      .merge(Link.alive)
+      .merge(Link.alive.not_draft)
       .where(links: { user_id: id })
       .where.not(reviews_count: 0)
       .preload(:link)

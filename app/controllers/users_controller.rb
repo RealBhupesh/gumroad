@@ -307,11 +307,23 @@ class UsersController < ApplicationController
       share_image_tags = [%(<meta property="og:image" content="#{escaped_share_image}">),
                           %(<meta property="og:image:alt" content="#{alt}">)]
       if preview_url
+        # Dimensions + type mirror PageMeta::User: they let Facebook's crawler
+        # render the card on the FIRST share after a scrape instead of an
+        # imageless preview while it processes the image asynchronously.
+        share_image_tags << %(<meta property="og:image:type" content="image/png">)
+        share_image_tags << %(<meta property="og:image:width" content="#{SubscribePreviewGeneratorService::OUTPUT_WIDTH}">)
+        share_image_tags << %(<meta property="og:image:height" content="#{SubscribePreviewGeneratorService::OUTPUT_HEIGHT}">)
         share_image_tags << %(<meta property="twitter:card" content="summary_large_image">)
         share_image_tags << %(<meta property="twitter:image" content="#{escaped_share_image}">)
         share_image_tags << %(<meta property="twitter:image:alt" content="#{alt}">)
       end
       share_image_tags = share_image_tags.join("\n    ")
+      fb_verification_content = facebook_domain_verification_content(user)
+      fb_verification_tag = if fb_verification_content
+        %(<meta name="facebook-domain-verification" content="#{ERB::Util.h(fb_verification_content)}">)
+      else
+        ""
+      end
       live_reload = if current_seller_owns_profile?
         custom_html_live_reload_script(version_src: profile_landing_src(user, "version"), nonce:)
       else
@@ -329,6 +341,7 @@ class UsersController < ApplicationController
             <meta property="og:type" content="profile">
             <meta property="og:url" content="#{canonical}">
             #{share_image_tags}
+            #{fb_verification_tag}
             #{profile_custom_html_analytics_head(user)}
             <meta name="csrf-token" content="#{CsrfTokenInjector::TOKEN_PLACEHOLDER}">
             <style>html,body{margin:0;padding:0;height:100%;overflow:hidden}iframe{display:block;width:100%;height:100%;border:0}</style>
