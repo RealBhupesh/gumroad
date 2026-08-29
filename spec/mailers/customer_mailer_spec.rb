@@ -26,6 +26,33 @@ describe CustomerMailer do
       expect(mail[:reply_to].value).to eq("bob@gumroad.com")
     end
 
+    context "when the purchase belongs to a two-purchase charge" do
+      let(:seller) { create(:named_seller) }
+      let(:purchase) { create(:purchase, link: create(:product, user: seller, name: "Paid edition"), seller:, email: "buyer@example.com") }
+      let(:purchase_two) { create(:purchase, link: create(:product, user: seller, name: "Free edition"), seller:, email: purchase.email) }
+      let!(:charge) { create(:charge, purchases: [purchase, purchase_two], seller:) }
+      let!(:split_receipt) { create(:customer_email_info, purchase:, email_name: SendgridEventInfo::RECEIPT_MAILER_METHOD) }
+
+      it "renders only the selected purchase after split receipts were sent" do
+        rendered = described_class.receipt(purchase.id)
+
+        expect(purchase.split_charge_receipt_sent?).to be(true)
+        expect(rendered.subject).to eq("You bought Paid edition!")
+        expect(rendered.subject).not_to include("Free edition")
+      end
+
+      it "keeps a historical charge-keyed receipt combined" do
+        split_receipt.destroy!
+        create(:customer_email_info, purchase: nil, email_name: SendgridEventInfo::RECEIPT_MAILER_METHOD,
+                                     email_info_charge_attributes: { charge_id: charge.id })
+
+        rendered = described_class.receipt(purchase.id)
+
+        expect(purchase.split_charge_receipt_sent?).to be(false)
+        expect(rendered.subject).to eq("You bought Paid edition and Free edition")
+      end
+    end
+
     context "when support email exists" do
       subject(:mail) do
         user = create(:user, email: "bob@gumroad.com", name: "bob walsh")
@@ -310,14 +337,35 @@ describe CustomerMailer do
       end
 
       context "when there are recommended products" do
-        let(:recommendable_product) do
-          create(:product, :recommendable, name: "Recommended product", price_cents: 9_99)
+        let(:recommended_seller) { create(:recommendable_user, name: "Recommended seller") }
+        let(:recommendable_products) do
+          products = create_list(
+            :product,
+            4,
+            :with_films_taxonomy,
+            user: recommended_seller,
+            name: "Recommended product",
+            price_cents: 9_99,
+          )
+          products.each { create(:purchase, link: _1, created_at: 1.week.ago) }
+          products.each(&:reload)
         end
         let!(:affiliate) do
           create(
             :direct_affiliate,
-            seller: recommendable_product.user,
-            products: [recommendable_product], affiliate_user: create(:user)
+            seller: recommended_seller,
+            products: recommendable_products,
+            affiliate_user: create(:user),
+          )
+        end
+        let!(:product_review_stat) do
+          create(
+            :product_review_stat,
+            link: recommendable_products.first,
+            reviews_count: 2,
+            average_rating: 4.5,
+            ratings_of_four_count: 1,
+            ratings_of_five_count: 1,
           )
         end
 
@@ -326,7 +374,7 @@ describe CustomerMailer do
           seller.update!(recommendation_type: User::RecommendationType::GUMROAD_AFFILIATES_PRODUCTS)
         end
 
-        it "includes recommended products section" do
+        it "includes four recommended products in two rows" do
           expect(RecommendedProductsService).to receive(:fetch).with(
             {
               model: "sales",
@@ -335,12 +383,27 @@ describe CustomerMailer do
               number_of_results: RecommendedProducts::BaseService::NUMBER_OF_RESULTS,
               user_ids: nil,
             }
-          ).and_return(Link.where(id: [recommendable_product.id]))
+          ).and_return(Link.where(id: recommendable_products.map(&:id)))
 
           mail = CustomerMailer.receipt(purchase.id)
 
           expect(mail.body.sanitized).to have_text("Customers who bought this item also bought")
           expect(mail.body.sanitized).to have_text("$9.99")
+
+          html = Nokogiri::HTML(mail.body.decoded)
+          rows = html.css("table.two-product-card-table > tbody > tr")
+          expect(rows.map { _1.xpath("./td").size }).to eq([2, 2])
+          expect(rows.map { _1["class"].to_s.split }).to eq([["product-card-row-with-gap"], []])
+          cell_classes = rows.flat_map { _1.xpath("./td") }.map { _1["class"].to_s.split }
+          expected_cell_classes = [
+            ["product-card-cell-with-gap"],
+            ["product-card-cell-with-gap"],
+            ["product-card-cell-with-gap"],
+            [],
+          ]
+          expect(cell_classes).to eq(expected_cell_classes)
+          expect(html.css("table.product-card-table").map { _1["align"] }).to eq(["center"] * 4)
+          expect(html.css(".rating").map { _1.text.squish }).to eq(["★ 4.5 (2)"])
         end
       end
     end
@@ -1353,6 +1416,25 @@ describe CustomerMailer do
       mail = CustomerMailer.grouped_receipt(purchases.map(&:id))
       expect(mail.to).to eq([purchases.last.email])
       expect(mail.subject).to eq("Receipts for Purchases")
+    end
+
+    it "keeps recommendations enabled by default" do
+      purchase = purchases.first
+      expect(RecommendedProducts::CheckoutService).to receive(:fetch_for_receipt).with(
+        purchaser: nil,
+        receipt_product_ids: [product.id],
+        recommender_model_name: kind_of(String),
+        limit: 4,
+      ).and_return([])
+
+      CustomerMailer.grouped_receipt([purchase.id]).body.decoded
+    end
+
+    it "can disable recommendations for a narrowed lookup" do
+      purchase = purchases.first
+      expect(RecommendedProducts::CheckoutService).not_to receive(:fetch_for_receipt)
+
+      CustomerMailer.grouped_receipt([purchase.id], recommendations: false).body.decoded
     end
 
     it "skips failed purchases whose charge has no successful purchases" do

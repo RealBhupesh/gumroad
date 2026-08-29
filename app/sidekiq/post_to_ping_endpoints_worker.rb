@@ -16,7 +16,7 @@ class PostToPingEndpointsWorker
     else
       purchase = Purchase.find(purchase_id)
       user = purchase.seller
-      ping_params = purchase.payload_for_ping_notification(url_parameters:, resource_name:)
+      ping_params = purchase.payload_for_ping_notification(url_parameters: url_parameters.presence || purchase.url_parameters, resource_name:)
     end
 
     targets = user.ping_notification_targets(resource_name)
@@ -27,8 +27,10 @@ class PostToPingEndpointsWorker
     post_urls = targets.post_urls
     return if post_urls.empty?
 
+    # No URL vetting here: SsrfFilter.post in the individual worker validates the resolved IPs at
+    # connect time (and per redirect hop), and a pre-check here meant a transient empty DNS lookup
+    # silently dropped the ping with no retry (gp#2155).
     post_urls.each do |post_url, content_type|
-      next unless ResourceSubscription.valid_post_url?(post_url)
       PostToIndividualPingEndpointWorker.perform_async(post_url, ping_params.deep_stringify_keys, content_type, user.id)
     end
   end

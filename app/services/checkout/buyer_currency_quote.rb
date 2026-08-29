@@ -27,6 +27,8 @@ class Checkout::BuyerCurrencyQuote
                       :charges,
                       :line_allocations,
                       :later_charge_presentments,
+                      :listed_currency_rates,
+                      :listed_currency_codes,
                       keyword_init: true) do
     def id
       stripe_fx_quote_id
@@ -39,6 +41,16 @@ class Checkout::BuyerCurrencyQuote
     def future_installments_presentment_total_cents
       charges.to_a.sum { _1.future_installments_presentment_total_cents.to_i }
     end
+
+    # The rate `Purchase#set_price_and_rate` should reuse for a purchase priced in
+    # `permalink`'s listed currency, bound at the same moment the quote was minted
+    # (gumroad-private#1958). nil for USD-listed lines and for tokens signed before this
+    # field shipped — both fall back to `set_price_and_rate`'s live `get_rate` read.
+    def listed_currency_rate_for(permalink, currency:)
+      return unless listed_currency_codes&.[](permalink.to_s).to_s.casecmp?(currency.to_s)
+
+      listed_currency_rates&.[](permalink.to_s)&.to_d
+    end
   end
 
   # One cart line's canonical (USD) money, as computed by the surcharge endpoint. The
@@ -50,7 +62,7 @@ class Checkout::BuyerCurrencyQuote
                         :charge_price_cents, :charge_tip_cents,
                         :charge_seller_tax_cents, :charge_gumroad_tax_cents,
                         :charge_shipping_cents, :later_charge_kind,
-                        :later_charge_price_cents,
+                        :later_charge_price_cents, :listed_currency_rate,
                         keyword_init: true) do
     # Builds a line from one product's surcharge calculation. The submitted price includes
     # the buyer's tip share, so the tip is carved back out here; the tax lands in the same
@@ -69,9 +81,15 @@ class Checkout::BuyerCurrencyQuote
     # that double-converts (a €10.00 product posts 1233 USD cents, converting again gives
     # 1520) and makes every non-USD-priced checkout fail quote verification. Covered by the
     # units-invariant example in the spec.
+    #
+    # `listed_currency_rate` is the caller's rate reading for this product's listed currency,
+    # taken at the same moment it converted this line to canonical USD cents
+    # (gumroad-private#1958). Binding it here lets the charge path re-derive
+    # `rate_converted_to_usd` from the token instead of a second, possibly-drifted read.
     def self.from_surcharge(permalink:, product:, tax_result:, tip_cents:, shipping_usd_cents:,
                             charge_tax_result: nil, charge_tip_cents: nil, charge_shipping_usd_cents: nil,
-                            later_charge_kind: nil, later_charge_price_cents: nil, charge_now: true)
+                            later_charge_kind: nil, later_charge_price_cents: nil, charge_now: true,
+                            listed_currency_rate: nil)
       price_cents = tax_result.price_cents.to_i
       # The submitted price and tip are buyer-controlled request params. A crafted
       # negative price would make clamp's bounds invalid (min > max) and raise, and a
@@ -110,7 +128,8 @@ class Checkout::BuyerCurrencyQuote
         charge_gumroad_tax_cents: charge_seller_responsible ? 0 : charge_tax_cents,
         charge_shipping_cents: (charge_shipping_usd_cents.nil? ? shipping_usd_cents : charge_shipping_usd_cents).round.to_i,
         later_charge_kind:,
-        later_charge_price_cents:
+        later_charge_price_cents:,
+        listed_currency_rate:
       )
     end
 
@@ -179,6 +198,8 @@ class Checkout::BuyerCurrencyQuote
                            :line_allocations,
                            :future_installments_presentment_total_cents,
                            :later_charge_presentments,
+                           :listed_currency_rates,
+                           :listed_currency_codes,
                            keyword_init: true)
 
   TOKEN_PURPOSE = :buyer_currency_quote
@@ -190,8 +211,45 @@ class Checkout::BuyerCurrencyQuote
   # falls back to canonical USD.
   MAX_QUOTED_CHARGES = 4
 
-  def self.create(line_items:, canonical_total_cents:, ip:)
-    new(line_items:, canonical_total_cents:, ip:).create
+  def self.create(line_items:, canonical_total_cents:, ip:, currency: nil)
+    new(line_items:, canonical_total_cents:, ip:, currency:).create
+  end
+
+  # Whether this cart clears the gates in #create that no currency can get it past: a total that
+  # isn't positive, lines that don't reconcile, more sellers than MAX_QUOTED_CHARGES, a seller who
+  # isn't enabled, a free trial, a mixed recurring cart, a tip on a non-USD listing. Asked by the
+  # surcharge endpoint before it publishes a currency menu — a cart that fails one of these can be
+  # quoted in nothing, so listing its settleable currencies would offer the buyer a row of choices
+  # that each vanish the moment they are picked.
+  def self.cart_quotable?(line_items:, canonical_total_cents:)
+    new(line_items:, canonical_total_cents:, ip: nil).cart_quotable?
+  end
+
+  # A cart with every line already listed in the buyer's currency takes the direct-listed lane.
+  # Any other listing shape can use this quote lane once the separate cart and settlement gates
+  # pass, including a cart that mixes a buyer-currency listing with a USD listing.
+  #
+  # Decided per prospective CHARGE (per seller), not per cart: eligibility refuses an
+  # all-listed charge at charge time, so a multi-seller cart where one seller's lines are all
+  # in the buyer's currency must not be quoted — the token would be minted here and then
+  # refused there, failing the buyer's payment closed (BuyerCurrencyQuoteInvalid) on every
+  # retry. Such a cart falls back to canonical USD instead.
+  def self.buyer_currency_listing_quotable?(line_items:, buyer_currency:)
+    return false if line_items.blank?
+    # Same reason cart_quotable? guards this: a caller can hand over a line built from a product
+    # lookup that found nothing, and a public entry point must fall back rather than raise.
+    return false if line_items.any? { _1.product.nil? }
+
+    line_items.group_by { _1.product.user_id }.each_value.all? do |charge_line_items|
+      charge_line_items.any? do |line_item|
+        line_item.product.price_currency_type.to_s.downcase != buyer_currency.to_s.downcase
+      end
+    end
+  end
+
+  def self.normalize_requested_currency(currency)
+    code = currency.to_s.downcase.presence
+    code if code && CURRENCY_CHOICES.key?(code)
   end
 
   # Verifies the quote token submitted with a checkout against ONE charge: this seller, this
@@ -244,7 +302,9 @@ class Checkout::BuyerCurrencyQuote
       fx_rate: BigDecimal(charge_payload.fetch("fx_rate")),
       stripe_fx_quote_id: charge_payload.fetch("stripe_fx_quote_id"),
       stripe_fx_quote_expires_at: Time.zone.parse(charge_payload.fetch("stripe_fx_quote_expires_at")),
-      later_charge_presentments: charge_payload["later_charge_presentments"] || []
+      later_charge_presentments: charge_payload["later_charge_presentments"] || [],
+      listed_currency_rates: charge_payload["listed_currency_rates"] || {},
+      listed_currency_codes: charge_payload["listed_currency_codes"] || {}
     )
   rescue ActiveSupport::MessageVerifier::InvalidSignature, KeyError, TypeError, ArgumentError => e
     raise InvalidToken, e.message
@@ -263,6 +323,44 @@ class Checkout::BuyerCurrencyQuote
       raise(InvalidToken, "quote covers no charge for this seller")
   end
 
+  # Signature- and expiry-checked but non-authoritative (gumroad-private#1958): confirms the
+  # token wasn't tampered with and is still inside its quote window, not
+  # seller/merchant-account/totals — `verify!` still runs the full check later via
+  # `Charge::CreateService#locked_buyer_currency_quote!` on Stripe charges. The expiry check is
+  # load-bearing on its own, though: non-Stripe charges (PayPal) never reach `verify!` — the
+  # charge service discards the token there — yet the rate bound here has already priced the
+  # purchase. Signatures do not age, so without this a buyer could replay a months-old token on
+  # a PayPal checkout and buy at a stale rate; with it, a replay is bounded by the quote window
+  # like every other consumer of the token.
+  def self.listed_currency_rate_hint(token:, seller_id:, permalink:, currency:)
+    return if token.blank?
+
+    payload = verifier.verify(token)
+    charge_payloads = payload["charges"].presence || [payload]
+    charge_payload = charge_payloads.find { |cp| cp["seller_id"] == seller_id }
+    return if charge_payload.blank?
+    return if Time.zone.parse(charge_payload.fetch("stripe_fx_quote_expires_at")) <= Time.current
+
+    return unless charge_payload.dig("listed_currency_codes", permalink.to_s).to_s.casecmp?(currency.to_s)
+
+    charge_payload.dig("listed_currency_rates", permalink.to_s)&.to_d
+  rescue ActiveSupport::MessageVerifier::InvalidSignature, KeyError, TypeError, ArgumentError
+    nil
+  end
+
+  # Signature-checked but non-authoritative, like listed_currency_rate_hint: the currency the
+  # buyer confirmed when this token was minted. The picker means it can differ from GeoIP's
+  # answer, and charge-time eligibility must gate on the confirmed one or verify! rejects the
+  # buyer's own valid token with "currency mismatch".
+  def self.quoted_currency_hint(token)
+    return if token.blank?
+
+    payload = verifier.verify(token)
+    normalize_requested_currency(payload["currency"])
+  rescue ActiveSupport::MessageVerifier::InvalidSignature, TypeError, ArgumentError
+    nil
+  end
+
   def self.verifier
     Rails.application.message_verifier(TOKEN_PURPOSE)
   end
@@ -276,65 +374,51 @@ class Checkout::BuyerCurrencyQuote
   end
   private_class_method :verifier, :normalize_canonical_line_items, :normalize_later_charge_line_items, :charge_payload_for
 
-  attr_reader :line_items, :canonical_total_cents, :ip
+  attr_reader :line_items, :canonical_total_cents, :ip, :currency
 
-  def initialize(line_items:, canonical_total_cents:, ip:)
+  def initialize(line_items:, canonical_total_cents:, ip:, currency: nil)
     @line_items = line_items
     @canonical_total_cents = canonical_total_cents.to_i
     @ip = ip
+    @currency = self.class.normalize_requested_currency(currency)
   end
 
-  def create
-    return if canonical_total_cents <= 0
-    return if line_items.blank?
+  # The gates that hold whatever currency is asked for. Kept in one predicate so `create` and
+  # `cart_quotable?` (the surcharge endpoint's currency-menu question) can never drift apart.
+  def cart_quotable?
+    return false if canonical_total_cents <= 0
+    return false if line_items.blank?
     # The per-line amounts are what the checkout will display, and the cart total is what
     # the quote locks and the buyer is charged; if they don't reconcile the lines cannot
     # honestly represent the total, so the whole cart falls back to canonical USD.
-    return unless line_items.sum(&:canonical_total_cents) == canonical_total_cents
+    return false unless line_items.sum(&:canonical_total_cents) == canonical_total_cents
     # A negative component means the submitted request was malformed (prices and tips
     # are sanitized above, but defense in depth: never lock a quote whose lines could
     # not represent a real cart).
-    return if line_items.any? { |line| line.to_h.except(:permalink, :product, :later_charge_kind).values.compact.any?(&:negative?) }
-
-    products = line_items.map(&:product)
+    return false if line_items.any? { |line| line.to_h.except(:permalink, :product, :later_charge_kind, :listed_currency_rate).values.compact.any?(&:negative?) }
     # A line item can carry a nil product when the caller built it from a product lookup
     # that found nothing (seen from an ad-hoc QA script — Sentry GUMROAD-Z5). The surcharge
     # endpoint already withholds the quote for unknown products, but the service must not
     # depend on every caller doing that: fall back to canonical USD instead of raising.
-    return if products.any?(&:nil?)
-
-    # One FX quote can only price one PaymentIntent, and the order pipeline creates one
-    # PaymentIntent per seller — so a cart holding items from several sellers is quoted
-    # once PER SELLER, here, before the buyer is shown any total. Grouping by seller id
-    # rather than loading a User row per cart line keeps this hot, debounced endpoint off
-    # an N+1; the User rows are loaded once per group below.
-    #
-    # Every group must be quotable or the whole cart falls back to canonical US dollars
-    # (any `return` below). Quoting part of a cart would show the buyer a total that mixes
-    # local-currency lines with dollar lines, and no single figure could then be both the
-    # amount displayed and the amount charged.
-    line_items_by_seller = self.line_items_by_seller
-    # Checked before any Stripe call, because the cost this bounds is the FX round trips below
-    # (see MAX_QUOTED_CHARGES).
-    return if line_items_by_seller.length > MAX_QUOTED_CHARGES
-
-    sellers_by_id = User.where(id: line_items_by_seller.keys).index_by(&:id)
-    return unless sellers_by_id.length == line_items_by_seller.length
-
-    sellers = line_items_by_seller.keys.map { sellers_by_id.fetch(_1) }
-    return unless sellers.all? { Checkout::BuyerCurrencyEligibility.seller_enabled?(_1) }
-
-    buyer_currency = buyer_currency_for_ip(ip)
-    return if buyer_currency.blank? || buyer_currency == Currency::USD
-    return unless StripeChargeProcessor.charge_minor_units_compatible?(buyer_currency)
-    # The quote locks each charge's total, so every item must individually support
-    # presentment; one unsupported item (whose charge amount could differ from the total
-    # the quote locked) means the whole cart falls back to canonical USD. The buyer's
-    # currency is known by this point because one of the product gates depends on it.
-    return unless line_items.all? { |line_item| quotable_line_item?(line_item, buyer_currency:) }
+    products = line_items.map(&:product)
+    return false if products.any?(&:nil?)
+    # Checked before any Stripe call, because the cost this bounds is the FX round trips
+    # `create` makes below (see MAX_QUOTED_CHARGES).
+    return false if line_items_by_seller.length > MAX_QUOTED_CHARGES
+    # Every seller must have something to charge. `charge_quote_for` withholds the quote for a
+    # seller whose lines are all free, and one withheld charge takes the whole cart back to
+    # canonical USD — so a paid-plus-free cart is unquotable in every currency, not just the one
+    # that happened to be tried.
+    return false unless line_items_by_seller.each_value.all? { |seller_lines| seller_lines.sum(&:canonical_total_cents).positive? }
+    return false unless sellers_by_id.length == line_items_by_seller.length
+    return false unless sellers.all? { Checkout::BuyerCurrencyEligibility.seller_enabled?(_1) }
+    # A line whose SHAPE cannot be quoted — a free trial, or a later-charge product from a seller
+    # outside the subscription ramp. The one part of `quotable_line_item?` that does depend on the
+    # currency is applied in `create`.
+    return false unless line_items.all? { |line_item| quotable_line_item_shape?(line_item) }
     # Preorders, commissions, and installment choices have a different amount today than the
     # cart total. Keep that first lift to one line so one signed agreement maps to one later owner.
-    return if line_items.many? && line_items.any?(&:partial_or_setup_charge?)
+    return false if line_items.many? && line_items.any?(&:partial_or_setup_charge?)
     # A cart mixing a membership with a non-membership falls back, matching what the charge path
     # does with it: BuyerCurrencyEligibility#later_charge_setup_in_ramp? exempts a card-saving
     # checkout only when EVERY purchase on the charge is a plain membership. The shapes that rule
@@ -347,7 +431,7 @@ class Checkout::BuyerCurrencyQuote
     # the total they confirmed. A guest buying a membership alongside a one-off could not
     # complete that checkout at all, and reloading reproduced it.
     recurring, one_time = products.partition(&:is_recurring_billing?)
-    return if recurring.any? && one_time.any?
+    return false if recurring.any? && one_time.any?
     # Tip on a non-USD listing is not safe to quote: the surcharge request and the order
     # builder split it over different price bases and convert at different points, so the
     # two can disagree by a cent and `verify!` fails the buyer's payment on "total mismatch".
@@ -359,8 +443,29 @@ class Checkout::BuyerCurrencyQuote
     # token whose per-line totals then fail verification.
     if products.any? { |product| product.price_currency_type.to_s.downcase != Currency::USD } &&
        line_items.any? { |line| line.tip_cents.to_i.positive? }
-      return
+      return false
     end
+
+    true
+  end
+
+  def create
+    # One FX quote can only price one PaymentIntent, and the order pipeline creates one
+    # PaymentIntent per seller — so a cart holding items from several sellers is quoted
+    # once PER SELLER, below, before the buyer is shown any total. Grouping by seller id
+    # rather than loading a User row per cart line keeps this hot, debounced endpoint off
+    # an N+1; the User rows are loaded once per group.
+    #
+    # Every group must be quotable or the whole cart falls back to canonical US dollars
+    # (any `return` below). Quoting part of a cart would show the buyer a total that mixes
+    # local-currency lines with dollar lines, and no single figure could then be both the
+    # amount displayed and the amount charged.
+    return unless cart_quotable?
+
+    buyer_currency = currency.presence || buyer_currency_for_ip(ip)
+    return if buyer_currency.blank? || buyer_currency == Currency::USD
+    return unless StripeChargeProcessor.charge_minor_units_compatible?(buyer_currency)
+    return unless self.class.buyer_currency_listing_quotable?(line_items:, buyer_currency:)
 
     charge_quotes = line_items_by_seller.map do |seller_id, seller_line_items|
       charge_quote_for(seller: sellers_by_id.fetch(seller_id), charge_line_items: seller_line_items, buyer_currency:)
@@ -430,6 +535,16 @@ class Checkout::BuyerCurrencyQuote
     # (one PaymentIntent) at order time, so each group is quoted separately.
     def line_items_by_seller
       @line_items_by_seller ||= line_items.group_by { _1.product.user_id }
+    end
+
+    # One query for the cart's sellers, shared by the gates and by the per-charge quoting below.
+    # A group whose id is missing here is a deleted user, which `cart_quotable?` refuses.
+    def sellers_by_id
+      @sellers_by_id ||= User.where(id: line_items_by_seller.keys).index_by(&:id)
+    end
+
+    def sellers
+      line_items_by_seller.keys.filter_map { sellers_by_id[_1] }
     end
 
     # What one canonical US dollar cent is worth in the buyer's currency, for the two amounts
@@ -503,6 +618,13 @@ class Checkout::BuyerCurrencyQuote
                          MerchantAccount.gumroad(StripeChargeProcessor.charge_processor_id)
       return unless merchant_account&.stripe_charge_processor?
       return unless Checkout::BuyerCurrencyEligibility.supported_merchant_account?(merchant_account, seller:)
+      if charge_line_items.any? { _1.product.is_recurring_billing? }
+        return unless Checkout::BuyerCurrencyEligibility.indian_card_mandate_presentment_supported?(
+          seller:,
+          merchant_account:,
+          currency: buyer_currency
+        )
+      end
       # Checked per charge, and last, because the learned mismatch marker is scoped to both the
       # account and the presentment currency: a mismatch learned for this account's EUR must not
       # suppress quoting for its GBP, nor for a seller charging on a different account. Sellers
@@ -638,7 +760,19 @@ class Checkout::BuyerCurrencyQuote
         # the price/tip/shipping lines instead (see Charge::PresentmentAllocator).
         line_allocations:,
         future_installments_presentment_total_cents:,
-        later_charge_presentments:
+        later_charge_presentments:,
+        # Keep the existing scalar rate shape so older app instances can read tokens minted
+        # during a rolling deploy. The additive code map binds each rate to its denomination.
+        listed_currency_rates: charge_line_items.filter_map do |line_item|
+          next if line_item.listed_currency_rate.blank?
+
+          [line_item.permalink.to_s, line_item.listed_currency_rate.to_s]
+        end.to_h,
+        listed_currency_codes: charge_line_items.filter_map do |line_item|
+          next if line_item.listed_currency_rate.blank?
+
+          [line_item.permalink.to_s, line_item.product.price_currency_type.to_s.downcase]
+        end.to_h
       )
     end
 
@@ -714,8 +848,14 @@ class Checkout::BuyerCurrencyQuote
     # round trip. Eligible client-confirm cards and method-forced local methods instead
     # charge the listed amount directly, without an FX quote.
     def quotable_line_item?(line_item, buyer_currency:)
+      return false if line_item.product.price_currency_type.to_s.downcase == buyer_currency.to_s.downcase
+
+      quotable_line_item_shape?(line_item)
+    end
+
+    # Everything about a line that rules it out no matter which currency is asked for.
+    def quotable_line_item_shape?(line_item)
       product = line_item.product
-      return false if product.price_currency_type.to_s.downcase == buyer_currency.to_s.downcase
       return false if product.free_trial_enabled?
       # A plain membership is quotable when the seller is in the subscription ramp: its
       # first charge is the full period price, which equals the locked cart total. This
@@ -773,6 +913,8 @@ class Checkout::BuyerCurrencyQuote
           stripe_fx_quote_id: charge_quote.stripe_fx_quote_id,
           stripe_fx_quote_expires_at: charge_quote.stripe_fx_quote_expires_at.iso8601,
           fx_rate: charge_quote.fx_rate.to_s("F"),
+          listed_currency_rates: charge_quote.listed_currency_rates,
+          listed_currency_codes: charge_quote.listed_currency_codes,
         }
       end
 

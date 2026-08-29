@@ -3,6 +3,8 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 import * as React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { SurchargesResponse } from "$app/data/customer_surcharge";
+
 import type { CartItem, CartState, Product as CartProduct } from "$app/components/Checkout/cartState";
 import { Checkout } from "$app/components/Checkout/index";
 import { StateContext, type CheckoutPaymentConfig, type State } from "$app/components/Checkout/payment";
@@ -134,6 +136,9 @@ const buildState = (overrides: Partial<State> = {}): State => ({
   city: "",
   state: "",
   zipCode: "10001",
+  buyerCurrency: null,
+  buyerCurrencyRemint: null,
+  unavailableBuyerCurrency: null,
   saveAddress: false,
   gift: null,
   customFieldValues: {},
@@ -171,9 +176,9 @@ const buildState = (overrides: Partial<State> = {}): State => ({
   ...overrides,
 });
 
-const renderCheckout = (state: State, cart: CartState) =>
+const renderCheckout = (state: State, cart: CartState, dispatch = vi.fn()) =>
   render(
-    <StateContext.Provider value={[state, vi.fn()]}>
+    <StateContext.Provider value={[state, dispatch]}>
       <Checkout discoverUrl="#" cart={cart} updateCart={vi.fn()} />
     </StateContext.Provider>,
   );
@@ -567,7 +572,7 @@ describe("Checkout method-forced listed-currency amounts", () => {
     );
 
     expect(getByLabelText("Tip").getAttribute("value")).toBe("10");
-    expect(getAllByText("R$10.00").length).toBeGreaterThan(0);
+    expect(getAllByText("R$10").length).toBeGreaterThan(0);
     expect(queryByText("R$9.97")).toBeNull();
     expect(queryByText("R$9.96")).toBeNull();
   });
@@ -581,6 +586,23 @@ describe("Checkout method-forced listed-currency amounts", () => {
     const { getAllByLabelText } = renderCheckout(brlState({ willSaveCard: true }), brlCart());
 
     expect(getAllByLabelText("Price").map((node) => node.textContent)).toEqual(["R$49.90"]);
+  });
+
+  it("hides the picker while checkout presents the listed currency", () => {
+    const state = brlState();
+    if (state.surcharges.type !== "loaded") throw new Error("Expected loaded surcharges");
+    state.surcharges.result = {
+      ...state.surcharges.result,
+      detected_buyer_currency: "brl",
+      available_buyer_currencies: [
+        { code: "usd", label: "$ (US Dollars)" },
+        { code: "eur", label: "€ (Euro)" },
+      ],
+    };
+
+    const { queryByLabelText } = renderCheckout(state, brlCart());
+
+    expect(queryByLabelText("Currency")).toBeNull();
   });
 
   it("stays in canonical USD while a saved card is selected, because that charge is not in the listed currency", () => {
@@ -684,5 +706,346 @@ describe("Checkout method-forced listed-currency amounts", () => {
 
     expect(getAllByLabelText("Price").map((node) => node.textContent)).toEqual(["CA$11.44"]);
     expect(queryByText("R$49.90")).toBeNull();
+  });
+});
+
+describe("Checkout direct-listed currency picker", () => {
+  const directListedPayment: CheckoutPaymentConfig = {
+    integration: "payment_element_client_confirm",
+    fallback_reason: null,
+    recurring_upi_registration: false,
+    disable_wallets: true,
+    request_apple_pay_merchant_tokens: false,
+    payment_element_wallets: false,
+    flat_payment_methods: true,
+    elements_options: {
+      stripe_elements_mode: "payment",
+      currency: "cad",
+      presentment_amount_cents: 1_500,
+      listed_currency_display: { currency: "cad", subunit_to_unit: 100 },
+      direct_listed_card: true,
+      payment_method_types: ["card"],
+      payment_method_list_token: null,
+      stripe_link_enabled: false,
+      stripe_connect_account_id: null,
+    },
+  };
+  const directListedSurcharges: SurchargesResponse = {
+    vat_id_valid: false,
+    has_vat_id_input: false,
+    shipping_rate_cents: 0,
+    tax_cents: 0,
+    tax_included_cents: 0,
+    subtotal: 1_000,
+    detected_buyer_currency: "cad",
+    available_buyer_currencies: [
+      { code: "usd", label: "$ (US Dollars)" },
+      { code: "cad", label: "CA$ (Canadian Dollars)" },
+      { code: "gbp", label: "£ (British Pounds)" },
+    ],
+    buyer_currency_quote: null,
+  };
+  const directListedState = (overrides: Partial<State> = {}) =>
+    buildState({
+      checkoutPayment: directListedPayment,
+      products: [stateProduct({ price: 1_000 })],
+      surcharges: { type: "loaded", result: directListedSurcharges },
+      ...overrides,
+    });
+  const directListedCart: CartState = {
+    items: [
+      cartItem({
+        product: cartProduct({ currency_code: "cad", exchange_rate: 1.5 }),
+        price: 1_500,
+      }),
+    ],
+    discountCodes: [],
+  };
+
+  it("renders a USD and listed-currency control on the direct-listed card lane", () => {
+    const dispatch = vi.fn();
+    const { getAllByLabelText, getByLabelText } = renderCheckout(directListedState(), directListedCart, dispatch);
+    const picker = getByLabelText("Currency");
+
+    expect(Array.from(picker.querySelectorAll("option"), (option) => option.value)).toEqual(["usd", "cad"]);
+    expect(picker).toHaveProperty("value", "cad");
+    expect(getAllByLabelText("Price").map((node) => node.textContent)).toEqual(["CA$15"]);
+
+    fireEvent.change(picker, { target: { value: "usd" } });
+    expect(dispatch).toHaveBeenCalledWith({ type: "set-value", buyerCurrency: "usd" });
+  });
+
+  it("stays on the listed currency when buyerCurrency is unset and GeoIP is not listed", () => {
+    // The mount treats null buyerCurrency as listed (null !== "usd"). The picker used to prefer
+    // detected / options[0], so a USD or GBP GeoIP painted USD next to a CAD total and CAD Element.
+    const { getAllByLabelText, getByLabelText } = renderCheckout(
+      directListedState({
+        surcharges: {
+          type: "loaded",
+          result: { ...directListedSurcharges, detected_buyer_currency: "gbp" },
+        },
+      }),
+      directListedCart,
+    );
+
+    expect(getByLabelText("Currency")).toHaveProperty("value", "cad");
+    expect(getAllByLabelText("Price").map((node) => node.textContent)).toEqual(["CA$15"]);
+  });
+
+  it("keeps the direct-listed control available while Save card is checked", () => {
+    const { getByLabelText } = renderCheckout(directListedState({ willSaveCard: true }), directListedCart);
+
+    expect(getByLabelText("Currency")).toBeTruthy();
+  });
+
+  it("renders canonical totals when USD is selected without losing the listed option", () => {
+    const { getAllByLabelText, getByLabelText } = renderCheckout(
+      directListedState({ buyerCurrency: "usd" }),
+      directListedCart,
+    );
+    const picker = getByLabelText("Currency");
+
+    expect(picker).toHaveProperty("value", "usd");
+    expect(Array.from(picker.querySelectorAll("option"), (option) => option.value)).toEqual(["usd", "cad"]);
+    expect(getAllByLabelText("Price").map((node) => node.textContent)).toEqual(["US$10"]);
+  });
+
+  it("keeps the listed total while a switch to the saved card is being re-quoted", () => {
+    // The held quote was minted for a new card, which charges the listed currency. Reading the
+    // display off the surface being switched TO flips the same held amounts to USD for the length
+    // of the round trip, so the total changes twice under the buyer. Paying stays blocked on the
+    // live `surcharges`, which is pending here.
+    const { getAllByLabelText } = renderCheckout(
+      directListedState({
+        buyerCurrency: "cad",
+        usingSavedCard: true,
+        surcharges: { type: "pending" },
+        buyerCurrencyRemint: {
+          surcharges: directListedSurcharges,
+          previousCurrency: "cad",
+          surfaceSwitch: true,
+          previousUsingSavedCard: false,
+        },
+      }),
+      directListedCart,
+    );
+
+    expect(getAllByLabelText("Price").map((node) => node.textContent)).toEqual(["CA$15"]);
+  });
+
+  it("does not expose quote-backed currencies after a tip moves the cart to canonical USD", () => {
+    const { getAllByLabelText, queryByLabelText } = renderCheckout(
+      directListedState({
+        products: [stateProduct({ price: 1_000, hasTippingEnabled: true })],
+        tip: { type: "percentage", percentage: 10 },
+      }),
+      {
+        ...directListedCart,
+        items: [
+          cartItem({
+            product: cartProduct({ currency_code: "cad", exchange_rate: 1.5, has_tipping_enabled: true }),
+            price: 1_500,
+          }),
+        ],
+      },
+    );
+
+    expect(queryByLabelText("Currency")).toBeNull();
+    expect(getAllByLabelText("Price").map((node) => node.textContent)).toEqual(["US$10"]);
+  });
+});
+
+describe("Checkout currency picker", () => {
+  const quotedSurcharges: SurchargesResponse = {
+    vat_id_valid: false,
+    has_vat_id_input: false,
+    shipping_rate_cents: 0,
+    tax_cents: 0,
+    tax_included_cents: 0,
+    subtotal: 1_000,
+    detected_buyer_currency: "cad",
+    available_buyer_currencies: [
+      { code: "usd", label: "$ (US Dollars)" },
+      { code: "cad", label: "CA$ (Canadian Dollars)" },
+    ],
+    buyer_currency_quote: {
+      token: "quote-token",
+      currency: "cad",
+      canonical_total_cents: 1_000,
+      presentment_total_cents: 1_250,
+      charge_presentment_total_cents: 1_250,
+      rate: 1.25,
+      subunit_to_unit: 100,
+      expires_at: "2999-01-01T00:00:00Z",
+      line_allocations: [
+        {
+          permalink: "prod",
+          price_cents: 1_250,
+          tip_cents: 0,
+          tax_cents: 0,
+          shipping_cents: 0,
+          total_cents: 1_250,
+        },
+      ],
+    },
+  };
+  const cart: CartState = { items: [cartItem()], discountCodes: [] };
+
+  it("shows the picker on a card checkout that can settle more than one currency", () => {
+    const { getByLabelText } = renderCheckout(
+      buildState({ surcharges: { type: "loaded", result: quotedSurcharges } }),
+      cart,
+    );
+    expect(getByLabelText("Currency")).toBeTruthy();
+  });
+
+  it("renders the picker directly below the Total row", () => {
+    const { getByLabelText, getByText } = renderCheckout(
+      buildState({ surcharges: { type: "loaded", result: quotedSurcharges } }),
+      cart,
+    );
+    const picker = getByLabelText("Currency");
+    const total = getByText("Total");
+    expect(total.compareDocumentPosition(picker) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("hides the picker and keeps USD totals when Apple Pay is selected", () => {
+    const { queryByLabelText, getAllByText } = renderCheckout(
+      buildState({
+        paymentElementType: "apple_pay",
+        surcharges: { type: "loaded", result: quotedSurcharges },
+      }),
+      cart,
+    );
+    expect(queryByLabelText("Currency")).toBeNull();
+    expect(getAllByText("US$10").length).toBeGreaterThan(0);
+  });
+
+  it("hides the picker when PayPal is selected", () => {
+    const { queryByLabelText } = renderCheckout(
+      buildState({
+        paymentMethod: "paypal",
+        surcharges: { type: "loaded", result: quotedSurcharges },
+      }),
+      cart,
+    );
+    expect(queryByLabelText("Currency")).toBeNull();
+  });
+
+  it("hides the picker when a new card will be saved", () => {
+    const { queryByLabelText } = renderCheckout(
+      buildState({
+        willSaveCard: true,
+        surcharges: { type: "loaded", result: quotedSurcharges },
+      }),
+      cart,
+    );
+
+    expect(queryByLabelText("Currency")).toBeNull();
+  });
+
+  it("keeps the picker and the summary in place while the chosen currency is re-quoted", () => {
+    const { getByLabelText, getByText } = renderCheckout(
+      buildState({
+        buyerCurrency: "usd",
+        surcharges: { type: "pending" },
+        buyerCurrencyRemint: { surcharges: quotedSurcharges, previousCurrency: "cad" },
+      }),
+      cart,
+    );
+
+    expect(getByLabelText("Currency")).toBeTruthy();
+    expect(getByText("Total")).toBeTruthy();
+    expect(getByText("Subtotal")).toBeTruthy();
+    expect(getByText("Updating total…")).toBeTruthy();
+  });
+
+  it("leaves the focused select in the document across the re-quote", () => {
+    const loaded = buildState({ surcharges: { type: "loaded", result: quotedSurcharges } });
+    const { getByLabelText, rerender } = renderCheckout(loaded, cart);
+    const select = getByLabelText("Currency");
+    select.focus();
+
+    rerender(
+      <StateContext.Provider
+        value={[
+          buildState({
+            buyerCurrency: "usd",
+            surcharges: { type: "pending" },
+            buyerCurrencyRemint: { surcharges: quotedSurcharges, previousCurrency: "cad" },
+          }),
+          vi.fn(),
+        ]}
+      >
+        <Checkout discoverUrl="#" cart={cart} updateCart={vi.fn()} />
+      </StateContext.Provider>,
+    );
+
+    expect(getByLabelText("Currency")).toBe(select);
+    expect(document.activeElement).toBe(select);
+  });
+
+  it("names the currency the server refused instead of switching the total quietly", () => {
+    const { getByText } = renderCheckout(
+      buildState({
+        buyerCurrency: "cad",
+        unavailableBuyerCurrency: "gbp",
+        surcharges: { type: "loaded", result: quotedSurcharges },
+      }),
+      cart,
+    );
+
+    expect(getByText(/We can't charge this cart in £ \(British Pounds\)/u)).toBeTruthy();
+  });
+
+  it("still names the refused currency when only one currency is left to offer", () => {
+    // Refusing a currency usually withdraws it from the menu, which can leave a single option and
+    // unmount the picker — exactly when the buyer needs to be told why their choice did not take.
+    const usdOnly: SurchargesResponse = {
+      ...quotedSurcharges,
+      detected_buyer_currency: "usd",
+      available_buyer_currencies: [{ code: "usd", label: "$ (US Dollars)" }],
+      buyer_currency_quote: null,
+    };
+    const { getByText, queryByLabelText } = renderCheckout(
+      buildState({
+        buyerCurrency: null,
+        unavailableBuyerCurrency: "gbp",
+        surcharges: { type: "loaded", result: usdOnly },
+      }),
+      cart,
+    );
+
+    expect(queryByLabelText("Currency")).toBeNull();
+    expect(getByText(/We can't charge this cart in £ \(British Pounds\)/u)).toBeTruthy();
+  });
+
+  it("stops saying the total is updating once the re-quote has failed", () => {
+    const { queryByText, getByText } = renderCheckout(
+      buildState({
+        buyerCurrency: "usd",
+        surcharges: { type: "error" },
+        buyerCurrencyRemint: { surcharges: quotedSurcharges, previousCurrency: "cad" },
+      }),
+      cart,
+    );
+
+    expect(queryByText("Updating total…")).toBeNull();
+    expect(getByText("Total")).toBeTruthy();
+  });
+
+  it("replaces an unavailable saved currency with the resolved picker value", () => {
+    const dispatch = vi.fn();
+    const { getByLabelText } = renderCheckout(
+      buildState({
+        buyerCurrency: "gbp",
+        surcharges: { type: "loaded", result: quotedSurcharges },
+      }),
+      cart,
+      dispatch,
+    );
+
+    expect(getByLabelText("Currency")).toBeTruthy();
+    expect(dispatch).toHaveBeenCalledWith({ type: "set-value", buyerCurrency: "cad" });
   });
 });

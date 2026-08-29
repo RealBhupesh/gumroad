@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[7.1].define(version: 2026_12_07_000000) do
+ActiveRecord::Schema[7.1].define(version: 2026_12_08_130000) do
   create_table "active_storage_attachments", charset: "utf8mb4", collation: "utf8mb4_unicode_ci", force: :cascade do |t|
     t.string "name", limit: 191, null: false
     t.string "record_type", limit: 191, null: false
@@ -181,8 +181,11 @@ ActiveRecord::Schema[7.1].define(version: 2026_12_07_000000) do
     t.integer "affiliate_basis_points"
     t.string "destination_url"
     t.bigint "flags", default: 0, null: false
+    t.string "workflow_schedule_token"
+    t.index ["affiliate_id", "link_id"], name: "index_affiliates_links_on_affiliate_id_and_link_id", unique: true
     t.index ["affiliate_id"], name: "index_affiliates_links_on_affiliate_id"
     t.index ["link_id"], name: "index_affiliates_links_on_link_id"
+    t.index ["workflow_schedule_token"], name: "index_affiliates_links_on_workflow_schedule_token"
   end
 
   create_table "ai_conversations", charset: "utf8mb4", collation: "utf8mb4_unicode_ci", force: :cascade do |t|
@@ -1096,6 +1099,19 @@ ActiveRecord::Schema[7.1].define(version: 2026_12_07_000000) do
     t.datetime "updated_at", null: false
     t.index ["stripe_person_id"], name: "index_guardians_on_stripe_person_id", unique: true
     t.index ["user_id"], name: "index_guardians_on_user_id"
+  end
+
+  create_table "gumhead_usage_events", charset: "utf8mb4", collation: "utf8mb4_unicode_ci", force: :cascade do |t|
+    t.bigint "user_id", null: false
+    t.string "model", null: false
+    t.bigint "input_tokens", default: 0, null: false
+    t.bigint "output_tokens", default: 0, null: false
+    t.bigint "cache_creation_input_tokens", default: 0, null: false
+    t.bigint "cache_creation_1h_input_tokens", default: 0, null: false
+    t.bigint "cache_read_input_tokens", default: 0, null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["user_id", "created_at"], name: "index_gumhead_usage_events_on_user_id_and_created_at"
   end
 
   create_table "gumroad_daily_analytics", charset: "utf8mb4", collation: "utf8mb4_unicode_ci", force: :cascade do |t|
@@ -2554,6 +2570,7 @@ ActiveRecord::Schema[7.1].define(version: 2026_12_07_000000) do
     t.string "token"
     t.datetime "token_expires_at"
     t.string "business_vat_id", limit: 191
+    t.string "stripe_mandate_id"
     t.index ["cancelled_at"], name: "index_subscriptions_on_cancelled_at"
     t.index ["deactivated_at"], name: "index_subscriptions_on_deactivated_at"
     t.index ["ended_at"], name: "index_subscriptions_on_ended_at"
@@ -3187,6 +3204,25 @@ ActiveRecord::Schema[7.1].define(version: 2026_12_07_000000) do
     t.integer "recent_follower_count", default: 0, null: false
     t.index ["recommendable", "recent_follower_count"], name: "index_wishlists_on_recommendable_and_recent_follower_count"
     t.index ["user_id"], name: "index_wishlists_on_user_id"
+  end
+
+  create_table "workflow_installment_schedule_intents", charset: "utf8mb4", collation: "utf8mb4_unicode_ci", force: :cascade do |t|
+    t.string "token", null: false
+    t.integer "installment_id", null: false
+    t.integer "rule_version", null: false
+    t.integer "old_delayed_delivery_time"
+    t.datetime "cutoff_reference_time", null: false
+    t.datetime "expected_published_at"
+    t.string "dispatch_token"
+    t.datetime "dispatch_expires_at"
+    t.string "fanout_token"
+    t.datetime "fanout_expires_at"
+    t.datetime "processed_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["installment_id"], name: "index_workflow_installment_schedule_intents_on_installment_id"
+    t.index ["processed_at", "dispatch_expires_at", "fanout_expires_at"], name: "index_workflow_intent_on_pending_dispatch"
+    t.index ["token"], name: "index_workflow_installment_schedule_intents_on_token", unique: true
   end
 
   create_table "workflows", id: :integer, charset: "utf8mb4", collation: "utf8mb4_unicode_ci", force: :cascade do |t|

@@ -27,8 +27,12 @@ class Api::WorkflowPresenter
       created_at: workflow.created_at,
       updated_at: workflow.updated_at,
     }
-    payload[:emails] = email_props if include_emails
+    payload[:emails] = present_emails(emails) if include_emails
     payload
+  end
+
+  def email_props(email, include_analytics: true)
+    present_emails([email], include_analytics:).sole
   end
 
   private
@@ -43,14 +47,14 @@ class Api::WorkflowPresenter
         .to_a
     end
 
-    def email_props
-      open_counts = batched_open_counts
-      click_counts = batched_click_counts
+    def present_emails(emails, include_analytics: true)
+      open_counts = include_analytics ? batched_open_counts(emails) : {}
+      click_counts = include_analytics ? batched_click_counts(emails) : {}
 
       emails.map do |email|
         sent_count = email.customer_count.to_i
-        open_count = open_counts.fetch(email.id, 0)
-        click_count = click_counts.fetch(email.id, 0)
+        open_count = open_counts.fetch(email.id, nil)
+        click_count = click_counts.fetch(email.id, nil)
 
         {
           id: email.external_id,
@@ -67,39 +71,28 @@ class Api::WorkflowPresenter
           },
           sent_count:,
           open_count:,
-          open_rate: rate(open_count, sent_count),
+          open_rate: open_count.nil? ? nil : rate(open_count, sent_count),
           click_count:,
-          click_rate: rate(click_count, sent_count),
+          click_rate: click_count.nil? ? nil : rate(click_count, sent_count),
           created_at: email.created_at,
-          updated_at: email.updated_at,
+          updated_at: [email.updated_at, email.installment_rule.updated_at].compact.max,
         }
       end
     end
 
-    def batched_open_counts
-      batched_counts(:unique_open_count) do |missing_ids|
-        pipeline = [
-          { "$match" => { "installment_id" => { "$in" => missing_ids } } },
-          { "$group" => { "_id" => "$installment_id", "count" => { "$sum" => 1 } } },
-        ]
-        CreatorEmailOpenEvent.collection.aggregate(pipeline).each_with_object({}) do |row, counts|
-          counts[row.fetch("_id").to_i] = row.fetch("count").to_i
-        end
+    def batched_open_counts(emails)
+      batched_counts(emails, :unique_open_count) do |missing_ids|
+        EmailEngagementDynamoStore.summaries(missing_ids).transform_values { _1[:open_count] }
       end
     end
 
-    def batched_click_counts
-      batched_counts(:unique_click_count) do |missing_ids|
-        CreatorEmailClickSummary
-          .in(installment_id: missing_ids)
-          .only(:installment_id, :total_unique_clicks)
-          .each_with_object({}) do |summary, counts|
-            counts[summary.installment_id] = summary.total_unique_clicks.to_i
-          end
+    def batched_click_counts(emails)
+      batched_counts(emails, :unique_click_count) do |missing_ids|
+        EmailEngagementDynamoStore.summaries(missing_ids).transform_values { _1[:click_pair_count] }
       end
     end
 
-    def batched_counts(cache_key)
+    def batched_counts(emails, cache_key)
       keys_by_id = emails.to_h do |email|
         event_key = email.key_for_cache(cache_key)
         [email.id, { event: event_key, api: "#{API_CACHE_PREFIX}_#{event_key}" }]
@@ -109,9 +102,9 @@ class Api::WorkflowPresenter
       missing_ids = []
 
       keys_by_id.each do |id, keys|
-        if cached_counts.key?(keys.fetch(:event))
-          counts[id] = cached_counts.fetch(keys.fetch(:event)).to_i
-        elsif cached_counts.key?(keys.fetch(:api))
+        # The installment event key has no TTL. DynamoDB reads are live GetItem;
+        # skip it (it can be a stale zero) and use the 5s API cache.
+        if cached_counts.key?(keys.fetch(:api))
           counts[id] = cached_counts.fetch(keys.fetch(:api)).to_i
         else
           missing_ids << id

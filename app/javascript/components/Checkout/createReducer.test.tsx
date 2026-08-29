@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SurchargesResponse } from "$app/data/customer_surcharge";
 
-import { createReducer } from "$app/components/Checkout/payment";
+import { createReducer, type CheckoutPaymentConfig } from "$app/components/Checkout/payment";
 
 const getSurcharges = vi.hoisted(() => vi.fn());
 vi.mock("$app/data/customer_surcharge", () => ({ getSurcharges }));
@@ -87,11 +87,12 @@ const stubSurchargeRequests = () => {
     resolve: (result: SurchargesResponse) => void;
     reject: (error: unknown) => void;
     signal: AbortSignal | undefined;
+    payload: unknown;
   }[] = [];
   getSurcharges.mockImplementation(
-    (_data: unknown, signal?: AbortSignal) =>
+    (data: unknown, signal?: AbortSignal) =>
       new Promise<SurchargesResponse>((resolve, reject) => {
-        requests.push({ resolve, reject, signal });
+        requests.push({ resolve, reject, signal, payload: data });
       }),
   );
   return requests;
@@ -100,6 +101,7 @@ const stubSurchargeRequests = () => {
 describe("createReducer surcharge refetches", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    document.cookie = "gumroad_buyer_currency=; path=/; max-age=0";
   });
 
   afterEach(() => {
@@ -108,7 +110,29 @@ describe("createReducer surcharge refetches", () => {
     vi.resetAllMocks();
   });
 
-  const renderCheckout = () => renderHook(() => createReducer(initialArgs));
+  const directListedCheckoutPayment: CheckoutPaymentConfig = {
+    integration: "payment_element_client_confirm" as const,
+    fallback_reason: null,
+    recurring_upi_registration: false,
+    disable_wallets: true,
+    request_apple_pay_merchant_tokens: false,
+    payment_element_wallets: false,
+    flat_payment_methods: true,
+    elements_options: {
+      stripe_elements_mode: "payment" as const,
+      currency: "cad",
+      presentment_amount_cents: 1_000,
+      listed_currency_display: { currency: "cad", subunit_to_unit: 100 },
+      payment_method_types: ["card"],
+      payment_method_list_token: null,
+      stripe_link_enabled: false,
+      stripe_connect_account_id: null,
+      direct_listed_card: true,
+    },
+  };
+
+  const renderCheckout = (overrides: Partial<Parameters<typeof createReducer>[0]> = {}) =>
+    renderHook(() => createReducer({ ...initialArgs, ...overrides }));
 
   it("passes an abort signal to getSurcharges and aborts it when a newer change invalidates", async () => {
     const requests = stubSurchargeRequests();
@@ -210,5 +234,103 @@ describe("createReducer surcharge refetches", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
     expect(result.current[0].surcharges).toEqual({ type: "loaded", result: freshResult });
+  });
+
+  it("passes the direct-listed Payment Element mount to the surcharge request", async () => {
+    const requests = stubSurchargeRequests();
+    renderCheckout({ checkoutPayment: directListedCheckoutPayment });
+
+    await act(() => vi.advanceTimersByTimeAsync(300));
+
+    expect(requests[0]?.payload).toMatchObject({
+      payment_details_source: "payment_element",
+      payment_element_mount_currency: "cad",
+      payment_element_direct_listed_currency: "cad",
+    });
+  });
+
+  it("keeps the listed selector capability while requesting USD", async () => {
+    const requests = stubSurchargeRequests();
+    const { result } = renderCheckout({ checkoutPayment: directListedCheckoutPayment });
+
+    await act(() => vi.advanceTimersByTimeAsync(300));
+    await act(async () => {
+      requests[0]?.resolve(
+        surchargesResponse({
+          detected_buyer_currency: "cad",
+          available_buyer_currencies: [
+            { code: "usd", label: "$ (US Dollars)" },
+            { code: "cad", label: "CA$ (Canadian Dollars)" },
+          ],
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    act(() => result.current[1]({ type: "set-value", buyerCurrency: "usd" }));
+    await act(() => vi.advanceTimersByTimeAsync(300));
+
+    expect(requests[1]?.payload).toMatchObject({
+      buyer_currency: "usd",
+      payment_details_source: "payment_element",
+      payment_element_mount_currency: "usd",
+      payment_element_direct_listed_currency: "cad",
+    });
+  });
+
+  it("marks saved-card surcharge requests so direct-listed currencies are not advertised", async () => {
+    const requests = stubSurchargeRequests();
+    renderCheckout({
+      checkoutPayment: directListedCheckoutPayment,
+      savedCreditCard: { type: "visa", number: "**** 4242", expiration_date: "12/30", requires_mandate: false },
+    });
+
+    await act(() => vi.advanceTimersByTimeAsync(300));
+
+    expect(requests[0]?.payload).toMatchObject({ payment_details_source: "saved_payment_method" });
+    expect(requests[0]?.payload).not.toHaveProperty("payment_element_mount_currency");
+    expect(requests[0]?.payload).not.toHaveProperty("payment_element_direct_listed_currency");
+  });
+
+  it("refetches direct-listed selector options when the buyer switches from a saved card to a new card", async () => {
+    const requests = stubSurchargeRequests();
+    const { result } = renderCheckout({
+      checkoutPayment: directListedCheckoutPayment,
+      savedCreditCard: { type: "visa", number: "**** 4242", expiration_date: "12/30", requires_mandate: false },
+    });
+
+    await act(() => vi.advanceTimersByTimeAsync(300));
+    await act(async () => {
+      requests[0]?.resolve(surchargesResponse());
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    act(() => result.current[1]({ type: "set-value", usingSavedCard: false }));
+    expect(result.current[0].surcharges.type).toBe("pending");
+    // The refetch still happens, but the amounts the summary was showing are held for it: the
+    // switch changes which currencies the server advertises, not what the cart costs.
+    expect(result.current[0].buyerCurrencyRemint?.surcharges).toEqual(surchargesResponse());
+    expect(result.current[0].buyerCurrencyRemint?.surfaceSwitch).toBe(true);
+    await act(() => vi.advanceTimersByTimeAsync(300));
+
+    expect(requests[1]?.payload).toMatchObject({
+      payment_details_source: "payment_element",
+      payment_element_mount_currency: "cad",
+      payment_element_direct_listed_currency: "cad",
+    });
+  });
+
+  it("passes the selected buyer currency on the next surcharge fetch", async () => {
+    const requests = stubSurchargeRequests();
+    const { result } = renderCheckout();
+    await act(() => vi.advanceTimersByTimeAsync(300));
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.payload).not.toHaveProperty("buyer_currency");
+
+    act(() => result.current[1]({ type: "set-value", buyerCurrency: "gbp" }));
+    expect(result.current[0].surcharges.type).toBe("pending");
+    await act(() => vi.advanceTimersByTimeAsync(300));
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.payload).toMatchObject({ buyer_currency: "gbp" });
   });
 });

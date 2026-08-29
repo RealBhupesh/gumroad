@@ -1065,6 +1065,43 @@ describe Order::ChargeService, :vcr do
       Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, seller_1)
     end
 
+    it "keeps seller-held Stripe purchases in progress when settlement data is not available yet" do
+      seller_stripe_account = create(:merchant_account, user: seller_1,
+                                                        charge_processor_merchant_id: "acct_seller_held_missing_settlement")
+      seller_1.update!(check_merchant_account_is_linked: true)
+      allow(CardParamsHelper).to receive(:build_chargeable).and_return(chargeable_for_buyer_presentment)
+      params = line_items_params.merge!(common_order_params_without_payment)
+      order, = Order::CreateService.new(params:).perform
+      expect(order.purchases.in_progress.count).to eq(2)
+
+      allow(ChargeProcessor).to receive(:create_payment_intent_or_charge!) do |merchant_account_arg, *_args|
+        stripe_charge_intent_without_flow_of_funds(merchant_account: merchant_account_arg)
+      end
+
+      charge_responses = Order::ChargeService.new(order:, params:).perform
+
+      charge = order.reload.charges.sole
+      purchases = order.purchases.order(:id).to_a
+      expect(charge.merchant_account).to eq(seller_stripe_account)
+      expect(purchases).to all(be_in_progress)
+      expect(purchases.map(&:stripe_transaction_id).uniq).to eq(["ch_missing_settlement"])
+      expect(purchases.map(&:flow_of_funds)).to all(be_nil)
+      expect(purchases.map(&:purchase_success_balance_id)).to all(be_nil)
+      expect(purchases.map(&:purchase_presentment)).to all(be_nil)
+      expect(charge).to have_attributes(processor_transaction_id: "ch_missing_settlement",
+                                        stripe_payment_intent_id: "pi_missing_settlement")
+      expect(charge_responses.fetch("unique-id-0")).to include(success: true,
+                                                               content_url: nil,
+                                                               should_show_receipt: false,
+                                                               show_view_content_button_on_product_page: false)
+      expect(charge_responses.fetch("unique-id-1")).to include(success: true,
+                                                               content_url: nil,
+                                                               should_show_receipt: false,
+                                                               show_view_content_button_on_product_page: false)
+      expect(FinalizeBuyerPresentmentChargeJob.jobs.size).to eq(1)
+      expect(FinalizeBuyerPresentmentChargeJob.jobs.first["args"]).to eq([charge.id])
+    end
+
     it "charges 2.9% + 30c of processor fee when seller has a Stripe merchant account and existing credit card is used for payment" do
       seller_stripe_account = create(:merchant_account, user: seller_1, charge_processor_merchant_id: create_verified_stripe_account(country: "US").id)
 
@@ -1347,6 +1384,228 @@ describe Order::ChargeService, :vcr do
 
       expect(charge_responses.size).to eq(1)
       expect(charge_responses[charge_responses.keys[0]]).to eq(order.purchases.last.purchase_response)
+    end
+
+    it "creates an exact mandate source for a saved Indian card on a free trial" do
+      Feature.activate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller_2)
+      merchant_account = MerchantAccount.gumroad(StripeChargeProcessor.charge_processor_id) ||
+        create(
+          :merchant_account,
+          user: nil,
+          charge_processor_id: StripeChargeProcessor.charge_processor_id,
+          charge_processor_merchant_id: nil
+        )
+      saved_card = CreditCard.create!(
+        charge_processor_id: StripeChargeProcessor.charge_processor_id,
+        stripe_customer_id: "cus_saved_indian_card",
+        processor_payment_method_id: "pm_saved_indian_card",
+        stripe_fingerprint: "saved_indian_card_fingerprint",
+        visual: "**** **** **** 4242",
+        card_type: CardType::VISA,
+        card_country: Compliance::Countries::IND.alpha2,
+        expiry_month: 12,
+        expiry_year: 2030,
+        json_data: { stripe_setup_intent_id: "seti_existing" }
+      )
+      buyer = create(:user, credit_card: saved_card)
+      setup_intent = instance_double(
+        StripeSetupIntent,
+        id: "seti_saved_indian_free_trial",
+        succeeded?: true,
+        requires_action?: false,
+        mandate: "mandate_saved_indian_free_trial"
+      )
+      mandate_amount = nil
+      expect(ChargeProcessor).to receive(:setup_future_charges!) do |account, chargeable, mandate_options:|
+        expect(account).to eq(merchant_account)
+        expect(chargeable).to be_a(Chargeable)
+        mandate = mandate_options.dig(:payment_method_options, :card, :mandate_options)
+        expect(mandate[:supported_types]).to eq(["india"])
+        mandate_amount = mandate[:amount]
+        setup_intent
+      end
+      params = {
+        line_items: [
+          {
+            uid: "unique-id-0",
+            permalink: free_trial_membership_product.unique_permalink,
+            perceived_price_cents: 100_00,
+            is_free_trial_purchase: true,
+            perceived_free_trial_duration: {
+              amount: free_trial_membership_product.free_trial_duration_amount,
+              unit: free_trial_membership_product.free_trial_duration_unit
+            },
+            quantity: 1
+          }
+        ]
+      }.merge(common_order_params_without_payment)
+      order, = Order::CreateService.new(params:, buyer:).perform
+
+      Order::ChargeService.new(order:, params:).perform
+
+      purchase = order.reload.purchases.sole
+      expect(purchase).to be_not_charged
+      expect(purchase).to be_is_indian_card_mandate_registration
+      expect(purchase.processor_setup_intent_id).to eq("seti_saved_indian_free_trial")
+      expect(purchase.charge.stripe_setup_intent_id).to eq("seti_saved_indian_free_trial")
+      expect(purchase.subscription.indian_card_mandate_source_purchase(saved_card.id)).to eq(purchase)
+      expect(saved_card.reload.stripe_setup_intent_id).to eq("seti_existing")
+      expect(mandate_amount).to eq(purchase.mandate_maximum_amount_cents)
+      expect(mandate_amount).to be_positive
+    ensure
+      Feature.deactivate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller_2)
+    end
+
+    it "keeps scoped mandate enforcement off for a mixed cart" do
+      Feature.activate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller_1)
+      merchant_account = MerchantAccount.gumroad(StripeChargeProcessor.charge_processor_id) ||
+        create(
+          :merchant_account,
+          user: nil,
+          charge_processor_id: StripeChargeProcessor.charge_processor_id,
+          charge_processor_merchant_id: nil
+        )
+      paid_membership = create(:membership_product, user: seller_1, price_cents: 10_00)
+      free_trial_membership = create(
+        :membership_product,
+        :with_free_trial_enabled,
+        user: seller_1,
+        price_cents: 20_00
+      )
+      saved_card = CreditCard.create!(
+        charge_processor_id: StripeChargeProcessor.charge_processor_id,
+        stripe_customer_id: "cus_mixed_cart_indian_card",
+        processor_payment_method_id: "pm_mixed_cart_indian_card",
+        stripe_fingerprint: "mixed_cart_indian_card_fingerprint",
+        visual: "**** **** **** 4242",
+        card_type: CardType::VISA,
+        card_country: Compliance::Countries::IND.alpha2,
+        expiry_month: 12,
+        expiry_year: 2030
+      )
+      buyer = create(:user, credit_card: saved_card)
+      params = {
+        line_items: [
+          {
+            uid: "paid-membership",
+            permalink: paid_membership.unique_permalink,
+            perceived_price_cents: 10_00,
+            quantity: 1
+          },
+          {
+            uid: "free-trial-membership",
+            permalink: free_trial_membership.unique_permalink,
+            perceived_price_cents: 20_00,
+            is_free_trial_purchase: true,
+            perceived_free_trial_duration: {
+              amount: free_trial_membership.free_trial_duration_amount,
+              unit: free_trial_membership.free_trial_duration_unit
+            },
+            quantity: 1
+          }
+        ]
+      }.merge(common_order_params_without_payment)
+      order, = Order::CreateService.new(params:, buyer:).perform
+      charge_intent = instance_double(
+        StripeChargeIntent,
+        id: "pi_mixed_recurring_cart",
+        client_secret: "pi_mixed_recurring_cart_secret",
+        succeeded?: false,
+        requires_action?: true
+      )
+      mandate_options = nil
+      allow(Charge::CreateService).to receive(:new) do |**args|
+        mandate_options = args[:mandate_options]
+        service = instance_double(Charge::CreateService)
+        allow(service).to receive(:perform) do
+          charge = order.charges.where(seller: seller_1).last
+          charge.update!(credit_card: saved_card, merchant_account:, stripe_payment_intent_id: charge_intent.id)
+          charge.charge_intent = charge_intent
+          charge
+        end
+        service
+      end
+
+      Order::ChargeService.new(order:, params:).perform
+
+      purchases = order.reload.purchases.order(:id).to_a
+      expect(purchases).to all(satisfy { !_1.is_indian_card_mandate_registration? })
+      mandate = mandate_options.dig(:payment_method_options, :card, :mandate_options)
+      expect(mandate[:amount]).to eq(purchases.map(&:mandate_maximum_amount_cents).max)
+      expect(mandate[:interval]).to eq("sporadic")
+      expect(order.charges.sole.merchant_account).to eq(merchant_account)
+    ensure
+      Feature.deactivate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller_1)
+    end
+
+    it "includes commission deposits in a shared mandate cap" do
+      Feature.activate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller_1)
+      seller_1.update!(created_at: User::MIN_AGE_FOR_SERVICE_PRODUCTS.ago - 1.day)
+      merchant_account = MerchantAccount.gumroad(StripeChargeProcessor.charge_processor_id) ||
+        create(:merchant_account, user: nil, charge_processor_id: StripeChargeProcessor.charge_processor_id)
+      membership = create(
+        :purchase_in_progress,
+        link: create(:membership_product, user: seller_1),
+        seller: seller_1,
+        merchant_account:,
+        is_original_subscription_purchase: true,
+        total_transaction_cents: 10_00
+      )
+      commission = create(
+        :purchase_in_progress,
+        link: create(:commission_product, user: seller_1),
+        seller: seller_1,
+        merchant_account:,
+        setup_future_charges: true,
+        total_transaction_cents: 50_00
+      )
+      order = create(:order, purchases: [membership, commission])
+      mandate_options = {
+        payment_method_options: { card: { mandate_options: { amount: 50_00 } } }
+      }
+      charge = instance_double(Charge, charge_intent: nil, credit_card: nil)
+      create_service = instance_double(Charge::CreateService, perform: charge)
+      allow(Charge::CreateService).to receive(:new).and_return(create_service)
+      service = described_class.new(order:, params: {})
+      expect(service).to receive(:mandate_options_for_stripe)
+        .with(purchases: match_array([membership, commission]))
+        .and_return(mandate_options)
+
+      service.send(
+        :create_charge_for_seller_purchases,
+        [membership, commission],
+        instance_double(Chargeable, requires_mandate?: true),
+        false,
+        true
+      )
+    ensure
+      Feature.deactivate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller_1)
+    end
+
+    it "does not read a missing payment intent when a mandate card's processor outcome is already handled" do
+      order = create(:order)
+      merchant_account = create(:merchant_account_stripe_connect, user: seller_1)
+      purchase = create(:purchase,
+                        link: product_1,
+                        seller: seller_1,
+                        merchant_account:,
+                        purchase_state: "in_progress",
+                        total_transaction_cents: 10_00)
+      credit_card = instance_double(CreditCard, requires_mandate?: true, update!: true)
+      charge = instance_double(Charge, charge_intent: nil, credit_card:)
+      processor_error = Charge::CreateService::BUYER_CURRENCY_QUOTE_INVALID_MESSAGE
+      create_service = instance_double(Charge::CreateService)
+      allow(create_service).to receive(:perform) do
+        purchase.errors.add(:base, processor_error)
+        charge
+      end
+      service = Order::ChargeService.new(order:, params: {})
+      allow(service).to receive(:mandate_options_for_stripe).and_return(nil)
+      allow(Charge::CreateService).to receive(:new).and_return(create_service)
+
+      expect { service.send(:create_charge_for_seller_purchases, [purchase], instance_double(Chargeable), false, false) }.not_to raise_error
+      expect(purchase.errors[:base]).to eq([processor_error])
+      expect(credit_card).not_to have_received(:update!)
     end
 
     it "fixes a preorder release price when its setup intent is created" do
@@ -1670,6 +1929,82 @@ describe Order::ChargeService, :vcr do
         expect(mandate_options.interval_count).to eq(1)
       end
 
+      it "creates an INR mandate when a buyer uses a saved Indian card" do
+        configure_seller_1_for_presentment_charges
+        Feature.activate_user(:buyer_local_currency, seller_1)
+        Feature.activate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, seller_1)
+        Feature.activate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller_1)
+        Feature.activate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller_1)
+        allow_any_instance_of(Checkout::BuyerCurrencyQuote).to receive(:buyer_currency_for_ip).and_return(Currency::INR)
+        allow_any_instance_of(Checkout::BuyerCurrencyEligibility).to receive(:buyer_currency_for_ip).and_return(Currency::INR)
+        create(:merchant_account, user: nil, charge_processor_merchant_id: nil, currency: Currency::USD)
+        allow(StripeFxQuote).to receive(:create).and_return(
+          StripeFxQuote::Quote.new(
+            id: "fxq_1U4M5cIBOqvOFDrfTPo6y5Y7",
+            expires_at: 30.minutes.from_now,
+            fx_rate: BigDecimal("0.0103528")
+          )
+        )
+
+        buyer = create(:user)
+        saved_card_params = indian_mandate_payment_params.merge(product_permalink: membership_product_2.unique_permalink)
+        saved_chargeable = CardParamsHelper.build_chargeable(saved_card_params, browser_guid)
+        saved_chargeable.prepare!
+        buyer.credit_card = CreditCard.create(
+          saved_chargeable,
+          CardDataHandlingMode::TOKENIZE_VIA_STRIPEJS,
+          buyer
+        )
+        buyer.save!
+        buyer.credit_card.update!(json_data: { stripe_setup_intent_id: "seti_old_terms" })
+
+        quote_line_item = Checkout::BuyerCurrencyQuote::LineItem.new(
+          permalink: membership_product_2.unique_permalink,
+          product: membership_product_2,
+          price_cents: 10_00,
+          tip_cents: 0,
+          seller_tax_cents: 0,
+          gumroad_tax_cents: 0,
+          shipping_cents: 0,
+          later_charge_kind: "subscription",
+          later_charge_price_cents: 10_00
+        )
+        quote_service = Checkout::BuyerCurrencyQuote.new(
+          line_items: [quote_line_item],
+          canonical_total_cents: 10_00,
+          ip: "103.48.196.103"
+        )
+        quote = quote_service.create
+        params = {
+          line_items: [
+            {
+              uid: "unique-id-0",
+              permalink: membership_product_2.unique_permalink,
+              perceived_price_cents: 10_00,
+              quantity: 1
+            }
+          ]
+        }.merge(common_order_params_without_payment).merge(buyer_currency_quote: quote.token)
+        order, = Order::CreateService.new(params:, buyer:).perform
+
+        Order::ChargeService.new(order:, params:).perform
+
+        charge = order.reload.charges.sole
+        expect(charge.credit_card.stripe_setup_intent_id).to be_nil
+        stripe_payment_intent = Stripe::PaymentIntent.retrieve(charge.stripe_payment_intent_id)
+        mandate_options = stripe_payment_intent.payment_method_options.card.mandate_options
+        expect(stripe_payment_intent.currency).to eq(Currency::INR)
+        expect(mandate_options).to be_present
+        expect(mandate_options.amount).to eq(stripe_payment_intent.amount)
+        expect(mandate_options.interval).to eq("month")
+        expect(mandate_options.interval_count).to eq(1)
+      ensure
+        Feature.deactivate_user(:buyer_local_currency, seller_1)
+        Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, seller_1)
+        Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller_1)
+        Feature.deactivate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller_1)
+      end
+
       it "creates a mandate for multiple membership purchases" do
         params = line_items_params_for_mandate.merge!(common_order_params_without_payment).merge!(indian_mandate_payment_params)
 
@@ -1711,6 +2046,32 @@ describe Order::ChargeService, :vcr do
         requires_mandate?: false,
         visual: "**** **** **** 4242",
         zip_code: "H2X 1Y4"
+      )
+    end
+
+    def stripe_charge_intent_without_flow_of_funds(merchant_account:)
+      processor_charge = BaseProcessorCharge.new
+      processor_charge.charge_processor_id = StripeChargeProcessor.charge_processor_id
+      processor_charge.id = "ch_missing_settlement"
+      processor_charge.refunded = false
+      processor_charge.fee = 59
+      processor_charge.fee_currency = Currency::USD
+      processor_charge.card_fingerprint = "card_fp"
+      processor_charge.card_expiry_month = 12
+      processor_charge.card_expiry_year = 2030
+      processor_charge.zip_check_result = "pass"
+
+      stripe_charge_processor = instance_double(StripeChargeProcessor)
+      allow(StripeChargeProcessor).to receive(:new).and_return(stripe_charge_processor)
+      allow(stripe_charge_processor).to receive(:get_charge).with(processor_charge.id, merchant_account:).and_return(processor_charge)
+
+      StripeChargeIntent.new(
+        payment_intent: Stripe::PaymentIntent.construct_from(
+          id: "pi_missing_settlement",
+          status: StripeIntentStatus::SUCCESS,
+          latest_charge: processor_charge.id
+        ),
+        merchant_account:
       )
     end
 
@@ -2378,6 +2739,22 @@ describe Order::ChargeService, :vcr do
         amount: 10_00,
         currency: Currency::USD
       )
+    end
+
+    it "keeps an unsupported setup currency in USD" do
+      order = create(:order)
+      service = described_class.new(order:, params: nil)
+      mandate_options = {
+        payment_method_options: {
+          card: { mandate_options: { amount: 10_00, currency: Currency::USD } }
+        }
+      }
+      locked_quote = Checkout::BuyerCurrencyQuote::Result.new(
+        currency: Currency::AUD,
+        fx_rate: BigDecimal("0.65")
+      )
+
+      expect(service.mandate_options_in_setup_currency(mandate_options, locked_quote)).to eq(mandate_options)
     end
   end
 

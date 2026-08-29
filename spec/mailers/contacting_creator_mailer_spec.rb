@@ -361,6 +361,19 @@ describe ContactingCreatorMailer do
           expect(mail.body.encoded).to include "Submit additional information"
         end
 
+        # The link outlives the deadline on purpose — check_if_needs_redirect refuses the late save,
+        # not the token expiry.
+        it "mints a link that still resolves after the deadline it quotes" do
+          mail = ContactingCreatorMailer.chargeback_notice(dispute.id)
+          token = mail.body.decoded[%r{/purchases/([^/?"]+)/dispute_evidence}, 1]
+          expect(token).to be_present
+
+          travel_to(dispute_evidence.seller_response_due_at + 1.hour) do
+            found = Purchase.find_by_secure_external_id(token, scope: Purchases::DisputeEvidenceController::SECURE_ID_SCOPE)
+            expect(found).to eq(purchase)
+          end
+        end
+
         # Hours are computed when the mail renders, not when it is enqueued, and
         # CreateMissingDisputeEvidenceJob backdates windows to a few hours to beat the processor's
         # cutoff. A notice queued with an hour left can therefore render with none, and asking for
@@ -2120,6 +2133,16 @@ describe ContactingCreatorMailer do
         expect(mail.body.encoded).to include product.long_url
         expect(mail.body.encoded).to include edit_link_url(product)
       end
+
+      it "renders from one delivery-time refund-policy snapshot" do
+        allow(Dispute).to receive(:find).with(dispute.id).and_return(dispute)
+        expect(purchase).to receive(:first_product_without_refund_policy).once.and_return(product)
+
+        mail = ContactingCreatorMailer.chargeback_lost_no_refund_policy(dispute.id)
+
+        expect(mail.body.encoded).to include product.name
+        expect(mail.body.encoded).to include edit_link_url(product)
+      end
     end
 
     context "for a dispute on Charge" do
@@ -2148,6 +2171,21 @@ describe ContactingCreatorMailer do
         product_without_refund_policy = charge.first_product_without_refund_policy
         expect(mail.body.encoded).to include "We noticed that #{product_without_refund_policy.name} currently doesn't have a refund policy."
         expect(mail.body.encoded).to include edit_link_url(product_without_refund_policy)
+      end
+    end
+
+    context "when every disputed product has since gained a refund policy" do
+      let(:product) { create(:product, user: seller) }
+      let!(:purchase) { create(:purchase, seller:, link: product) }
+      let(:dispute) { create(:dispute_formalized, purchase:) }
+
+      it "does not send" do
+        create(:product_refund_policy, seller:, product:)
+        product.update!(product_refund_policy_enabled: true)
+
+        mail = ContactingCreatorMailer.chargeback_lost_no_refund_policy(dispute.id)
+
+        expect(mail.message).to be_a(ActionMailer::Base::NullMail)
       end
     end
   end
@@ -2687,6 +2725,16 @@ describe ContactingCreatorMailer do
       expect(mail.body.encoded).to have_selector("img[src='#{ActionController::Base.helpers.image_path("email/solid-star.png")}']", count: 1)
       expect(mail.body.encoded).to have_selector("img[src='#{ActionController::Base.helpers.image_path("email/outline-star.png")}']", count: 4)
       expect(mail.body.encoded).to have_link("View all reviews", href: review.link.long_url)
+    end
+
+    it "does not name the gift sender when the giftee purchase inherited their full_name" do
+      giftee_purchase = create(:purchase, :gift_receiver, purchaser: nil, full_name: "Mahmood Pervaiz")
+      review = create(:product_review, purchase: giftee_purchase)
+
+      mail = ContactingCreatorMailer.review_submitted(review.id)
+
+      expect(mail.subject).to eq("#{giftee_purchase.email} reviewed #{review.link.name}")
+      expect(mail.body.encoded).not_to have_text("Mahmood Pervaiz")
     end
 
     context "no message" do

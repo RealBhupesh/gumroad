@@ -32,6 +32,7 @@ import * as React from "react";
 
 import { assertDefined } from "$app/utils/assert";
 import { classNames } from "$app/utils/classNames";
+import { isLikelyImageFile } from "$app/utils/prepareImageForUpload";
 
 import { InputtedDiscount } from "$app/components/CheckoutDashboard/DiscountInput";
 import { Modal } from "$app/components/Modal";
@@ -267,6 +268,7 @@ export const useRichTextEditor = ({
   className,
   editable = true,
   extensions = [],
+  allowUpsells = true,
   onChange,
   onCreate,
   onInputNonImageFiles,
@@ -278,6 +280,9 @@ export const useRichTextEditor = ({
   initialValue: Content;
   editable?: boolean | undefined;
   extensions?: Extensions | undefined;
+  // First-class Pages publish as static HTML with no client JS, and Page#content
+  // sanitization drops <upsell-card>. Keep the insert off that surface.
+  allowUpsells?: boolean | undefined;
   onChange?: ((newValue: string) => void) | undefined;
   onCreate?: ((editor: Editor) => void) | undefined;
   onInputNonImageFiles?: (files: File[]) => void;
@@ -298,7 +303,11 @@ export const useRichTextEditor = ({
     }
   }
 
-  const allExtensions = [...extensions, ...(placeholder ? [Placeholder.configure({ placeholder })] : []), UpsellCard];
+  const allExtensions = [
+    ...extensions,
+    ...(placeholder ? [Placeholder.configure({ placeholder })] : []),
+    ...(allowUpsells ? [UpsellCard] : []),
+  ];
   const dedupedExtensions = allExtensions.filter(
     (ext, index) => allExtensions.findIndex((e) => e.name === ext.name) === index,
   );
@@ -349,7 +358,7 @@ export const useRichTextEditor = ({
   }, [initialValue]);
   const imageSettings = useImageUploadSettings();
   const uploadFiles = ({ view, files }: { view: EditorView; files: File[] }) => {
-    const [images, nonImages] = partition(files, (file) => file.type.startsWith("image"));
+    const [images, nonImages] = partition(files, (file) => isLikelyImageFile(file));
     onInputNonImageFiles?.(nonImages);
     uploadImages({ view, files: images, imageSettings });
   };
@@ -402,34 +411,62 @@ export const useRichTextEditor = ({
 
   React.useEffect(() => editor?.setOptions({ editable }), [editable]);
 
+  // What useEditor itself applied at creation: when the effect fires because
+  // the editor materialized (not because content changed), it validates
+  // without replacing the state — a replay would discard edits typed since.
+  const appliedContentRef = React.useRef(content);
   React.useEffect(
     () =>
       queueMicrotask(() => {
-        // discard any history from before content was reset
-        editor?.view.updateState(
-          EditorState.create({
-            doc: createDocument(content, editor.state.schema),
-            schema: editor.schema,
-            plugins: editor.state.plugins,
-          }),
-        );
+        if (!editor) return;
+        try {
+          // Strict for JSON docs only: an unparseable doc otherwise mounts
+          // EMPTY and the next update/blur persists that emptiness. HTML
+          // strings keep the lenient parse (stored HTML legitimately contains
+          // tags with no schema rule).
+          const doc = createDocument(content, editor.state.schema, undefined, {
+            errorOnInvalidContent: typeof content !== "string",
+          });
+          // Also reset when recovering from a failure with unchanged content:
+          // the mounted doc may carry edits typed over the stale selection.
+          if (appliedContentRef.current !== content || contentResetFailures.has(editor)) {
+            // discard any history from before content was reset
+            editor.view.updateState(EditorState.create({ doc, schema: editor.schema, plugins: editor.state.plugins }));
+          }
+          appliedContentRef.current = content;
+          contentResetFailures.delete(editor);
+        } catch (error) {
+          // The wrong doc stays mounted; record the failure so callers that
+          // gate writes on the mounted doc keep them blocked.
+          contentResetFailures.set(editor, error);
+          // eslint-disable-next-line no-console
+          console.error("RichTextEditor: content reset failed", error);
+        }
       }),
-    [content],
+    [content, editor],
   );
 
   return editor ?? null;
 };
 
+// Editors whose most recent content reset threw. queueMicrotask swallows
+// exceptions, so this is the only signal that the mounted doc does not match
+// the content the caller last passed in.
+const contentResetFailures = new WeakMap<Editor, unknown>();
+export const lastContentResetFailed = (editor: Editor) => contentResetFailures.has(editor);
+
 export const RichTextEditorToolbar = ({
   editor,
   custom,
   productId,
+  allowUpsells = true,
   color = "primary",
   className,
 }: {
   custom?: React.ReactNode;
   editor: Editor;
   productId?: string;
+  allowUpsells?: boolean;
   color?: "primary" | "ghost";
   className?: string;
 }) => {
@@ -653,12 +690,14 @@ export const RichTextEditorToolbar = ({
                           )}
                         </React.Fragment>
                       ))}
-                      <PopoverClose asChild>
-                        <MenuListItem onClick={() => setIsUpsellModalOpen(true)}>
-                          <CartPlus className="size-5" />
-                          <span>Upsell</span>
-                        </MenuListItem>
-                      </PopoverClose>
+                      {allowUpsells ? (
+                        <PopoverClose asChild>
+                          <MenuListItem onClick={() => setIsUpsellModalOpen(true)}>
+                            <CartPlus className="size-5" />
+                            <span>Upsell</span>
+                          </MenuListItem>
+                        </PopoverClose>
+                      ) : null}
                       {productId ? (
                         <PopoverClose asChild>
                           <MenuListItem onClick={() => setIsReviewModalOpen(true)}>
@@ -693,11 +732,13 @@ export const RichTextEditorToolbar = ({
           />
         </div>
       </div>
-      <UpsellSelectModal
-        isOpen={isUpsellModalOpen}
-        onClose={() => setIsUpsellModalOpen(false)}
-        onInsert={handleUpsellInsert}
-      />
+      {allowUpsells ? (
+        <UpsellSelectModal
+          isOpen={isUpsellModalOpen}
+          onClose={() => setIsUpsellModalOpen(false)}
+          onInsert={handleUpsellInsert}
+        />
+      ) : null}
       {productId ? (
         <TestimonialSelectModal
           isOpen={isReviewModalOpen}
@@ -739,6 +780,7 @@ export const RichTextEditor = ({
   onChange,
   onCreate,
   extensions,
+  allowUpsells = true,
 }: {
   id?: string;
   className?: string;
@@ -749,6 +791,7 @@ export const RichTextEditor = ({
   onChange?: (newValue: string) => void;
   onCreate?: (editor: Editor) => void;
   extensions?: Extensions;
+  allowUpsells?: boolean;
 }) => {
   const editor = useRichTextEditor({
     id,
@@ -760,12 +803,17 @@ export const RichTextEditor = ({
     onChange,
     onCreate,
     extensions,
+    allowUpsells,
   });
 
   return (
     <div className="grid min-h-56 grid-rows-[max-content_1fr] rounded" data-gumroad-ignore>
       {editor ? (
-        <RichTextEditorToolbar editor={editor} className="rounded-t rounded-b-none border border-b-0 border-border" />
+        <RichTextEditorToolbar
+          editor={editor}
+          allowUpsells={allowUpsells}
+          className="rounded-t rounded-b-none border border-b-0 border-border"
+        />
       ) : null}
       <EditorContent className="rich-text" editor={editor} />
     </div>

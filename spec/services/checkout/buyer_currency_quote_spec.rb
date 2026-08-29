@@ -55,6 +55,46 @@ describe Checkout::BuyerCurrencyQuote do
   end
 
   describe ".create" do
+    it "quotes the requested currency instead of the IP currency" do
+      allow(StripeFxQuote).to receive(:create).with(
+        to_currency: Currency::USD,
+        from_currency: Currency::GBP,
+        stripe_account_id: merchant_account.charge_processor_merchant_id,
+        destination_account_id: nil
+      ).and_return(stripe_fx_quote)
+
+      result = described_class.create(
+        line_items: line_items_for(product),
+        canonical_total_cents: 10_00,
+        ip: "24.48.0.1",
+        currency: Currency::GBP
+      )
+
+      expect(result).to have_attributes(currency: Currency::GBP, canonical_total_cents: 10_00)
+    end
+
+    it "does not quote when the buyer asks for US dollars" do
+      result = described_class.create(
+        line_items: line_items_for(product),
+        canonical_total_cents: 10_00,
+        ip: "24.48.0.1",
+        currency: Currency::USD
+      )
+
+      expect(result).to be_nil
+    end
+
+    it "ignores an unknown requested currency and uses the IP currency" do
+      result = described_class.create(
+        line_items: line_items_for(product),
+        canonical_total_cents: 10_00,
+        ip: "24.48.0.1",
+        currency: "xyz"
+      )
+
+      expect(result).to have_attributes(currency: Currency::CAD)
+    end
+
     it "creates a signed quote for an eligible single-product checkout" do
       result = described_class.create(line_items: line_items_for(product), canonical_total_cents: 10_00, ip: "24.48.0.1")
 
@@ -279,6 +319,25 @@ describe Checkout::BuyerCurrencyQuote do
       end
     end
 
+    it "withholds an unsupported platform mandate currency before creating an FX quote" do
+      membership = create(:subscription_product, user: seller, price_cents: 10_00, price_currency_type: Currency::USD)
+      Feature.activate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller)
+      Feature.activate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller)
+      allow_any_instance_of(described_class).to receive(:buyer_currency_for_ip).and_return(Currency::AUD)
+      expect(StripeFxQuote).not_to receive(:create)
+
+      result = described_class.create(
+        line_items: line_items_for(membership),
+        canonical_total_cents: 10_00,
+        ip: "24.48.0.1"
+      )
+
+      expect(result).to be_nil
+    ensure
+      Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller)
+      Feature.deactivate_user(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller)
+    end
+
     it "returns nil instead of reporting an error when a line item carries no product" do
       orphan_line = described_class::LineItem.new(
         permalink: "gone", product: nil,
@@ -294,6 +353,19 @@ describe Checkout::BuyerCurrencyQuote do
       expect(result).to be_nil
     end
 
+    it "refuses a listing check whose line item carries no product" do
+      # The surcharge controller reaches buyer_currency_listing_quotable? without cart_quotable?
+      # having screened the lines, so the predicate has to answer instead of raising.
+      orphan_line = described_class::LineItem.new(
+        permalink: "gone", product: nil,
+        price_cents: 5_00, tip_cents: 0, seller_tax_cents: 0, gumroad_tax_cents: 0, shipping_cents: 0
+      )
+
+      expect(
+        described_class.buyer_currency_listing_quotable?(line_items: line_items_for(product) + [orphan_line], buyer_currency: Currency::CAD)
+      ).to be(false)
+    end
+
     context "with a cart spanning several sellers" do
       let(:other_seller) { create(:user, disable_buyer_local_currency: false, disable_buyer_currency_rounding: true) }
       let(:other_seller_product) { create(:product, user: other_seller, price_cents: 5_00, price_currency_type: Currency::USD) }
@@ -306,6 +378,34 @@ describe Checkout::BuyerCurrencyQuote do
       after do
         Feature.deactivate_user(:buyer_local_currency, other_seller)
         Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, other_seller)
+      end
+
+      it "returns nil when one seller's lines are all priced in the buyer's currency" do
+        # That seller's charge is refused by charge-time eligibility (all-listed, not the
+        # direct-listed lane on a multi-seller order), so minting a token here would fail the
+        # buyer's payment closed with BuyerCurrencyQuoteInvalid on every retry. The cart must
+        # fall back to canonical USD instead.
+        cad_product = create(:product, user: seller, price_cents: 10_00, price_currency_type: Currency::CAD)
+        line_items = line_items_for(cad_product, other_seller_product)
+        expect(StripeFxQuote).not_to receive(:create)
+
+        expect(described_class.buyer_currency_listing_quotable?(line_items:, buyer_currency: Currency::CAD)).to be(false)
+
+        result = described_class.create(line_items:, canonical_total_cents: 15_00, ip: "24.48.0.1")
+
+        expect(result).to be_nil
+      end
+
+      it "quotes a multi-seller cart when every seller's charge mixes in another currency" do
+        cad_product = create(:product, user: seller, price_cents: 10_00, price_currency_type: Currency::CAD)
+        line_items = line_items_for(product, cad_product, other_seller_product)
+
+        expect(described_class.buyer_currency_listing_quotable?(line_items:, buyer_currency: Currency::CAD)).to be(true)
+
+        result = described_class.create(line_items:, canonical_total_cents: 25_00, ip: "24.48.0.1")
+
+        expect(result).to have_attributes(currency: Currency::CAD, canonical_total_cents: 25_00)
+        expect(result.charges.map { _1.seller.id }).to eq([seller.id, other_seller.id])
       end
 
       it "locks one quote per seller and reports their sum as the cart total" do
@@ -720,13 +820,16 @@ describe Checkout::BuyerCurrencyQuote do
       expect(result).to be_nil
     end
 
-    it "returns nil when only one item of a mixed cart is priced in the buyer's currency" do
+    it "quotes a mixed cart when only one item is priced in the buyer's currency" do
       cad_product = create(:product, user: seller, price_cents: 10_00, price_currency_type: Currency::CAD)
-      expect(StripeFxQuote).not_to receive(:create)
+      line_items = line_items_for(product, cad_product)
 
-      result = described_class.create(line_items: line_items_for(product, cad_product), canonical_total_cents: 20_00, ip: "24.48.0.1")
+      expect(described_class.buyer_currency_listing_quotable?(line_items:, buyer_currency: Currency::CAD)).to be(true)
 
-      expect(result).to be_nil
+      result = described_class.create(line_items:, canonical_total_cents: 20_00, ip: "24.48.0.1")
+
+      expect(result).to have_attributes(currency: Currency::CAD, canonical_total_cents: 20_00)
+      expect(StripeFxQuote).to have_received(:create)
     end
 
     it "returns nil when any item in the cart offers an installment plan even if the rest are supported" do
@@ -1050,6 +1153,95 @@ describe Checkout::BuyerCurrencyQuote do
     end
   end
 
+  # The surcharge endpoint asks this before it publishes a currency menu. It has to answer for the
+  # gates that hold in every currency and only those, or the menu either offers currencies the cart
+  # can never be quoted in or hides ones it can.
+  describe ".cart_quotable?" do
+    def quotable?(line_items, canonical_total_cents)
+      described_class.cart_quotable?(line_items:, canonical_total_cents:)
+    end
+
+    it "accepts a plain paid cart" do
+      expect(quotable?(line_items_for(product), 10_00)).to be(true)
+    end
+
+    it "refuses a cart with nothing to charge" do
+      free = create(:product, user: seller, price_cents: 0)
+      expect(quotable?(line_items_for(free), 0)).to be(false)
+    end
+
+    it "refuses a cart whose lines do not add up to its total" do
+      expect(quotable?(line_items_for(product), 20_00)).to be(false)
+    end
+
+    it "refuses a cart spanning more sellers than one request will quote" do
+      extra_sellers = Array.new(described_class::MAX_QUOTED_CHARGES) do
+        create(:user, disable_buyer_local_currency: false).tap do |extra_seller|
+          Feature.activate_user(:buyer_local_currency, extra_seller)
+          Feature.activate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, extra_seller)
+        end
+      end
+      products = [product, *extra_sellers.map { create(:product, user: _1, price_cents: 10_00) }]
+
+      expect(quotable?(line_items_for(*products), 10_00 * products.length)).to be(false)
+    ensure
+      extra_sellers&.each do |extra_seller|
+        Feature.deactivate_user(:buyer_local_currency, extra_seller)
+        Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, extra_seller)
+      end
+    end
+
+    it "refuses a paid cart carrying a seller whose own lines are all free" do
+      # create() withholds the quote for a seller it would charge nothing, and one withheld charge
+      # takes the whole cart back to canonical USD.
+      free_seller = create(:user, disable_buyer_local_currency: false).tap do |other|
+        Feature.activate_user(:buyer_local_currency, other)
+        Feature.activate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, other)
+      end
+      free_product = create(:product, user: free_seller, price_cents: 0)
+
+      expect(quotable?(line_items_for(product, free_product), 10_00)).to be(false)
+    ensure
+      Feature.deactivate_user(:buyer_local_currency, free_seller) if free_seller
+      Feature.deactivate_user(Checkout::BuyerCurrencyEligibility::FEATURE_NAME, free_seller) if free_seller
+    end
+
+    it "refuses a cart whose seller is outside the rollout" do
+      other = create(:user, disable_buyer_local_currency: false)
+      expect(quotable?(line_items_for(create(:product, user: other, price_cents: 10_00)), 10_00)).to be(false)
+    end
+
+    it "refuses a cart mixing a membership with a one-off" do
+      Feature.activate_user(Checkout::BuyerCurrencyEligibility::SUBSCRIPTION_FEATURE_NAME, seller)
+      membership = create(:membership_product, user: seller, price_cents: 10_00)
+
+      expect(quotable?(line_items_for(product, membership), 20_00)).to be(false)
+    end
+
+    it "refuses a tip on a cart priced in something other than US dollars" do
+      eur_product = create(:product, user: seller, price_cents: 10_00, price_currency_type: Currency::EUR)
+      tipped = line_items_for(eur_product)
+      tipped.first.tip_cents = 1_00
+      tipped.first.price_cents = 9_00
+
+      expect(quotable?(tipped, 10_00)).to be(false)
+    end
+
+    # The currency-specific gates stay out of this predicate: they are what lets the endpoint
+    # drop one currency from the menu while keeping the rest.
+    it "accepts a cart priced in the currency a buyer might ask for" do
+      gbp_product = create(:product, user: seller, price_cents: 10_00, price_currency_type: Currency::GBP)
+
+      expect(quotable?(line_items_for(gbp_product), 10_00)).to be(true)
+      expect(described_class.create(
+               line_items: line_items_for(gbp_product),
+               canonical_total_cents: 10_00,
+               ip: "24.48.0.1",
+               currency: Currency::GBP
+             )).to be_nil
+    end
+  end
+
   describe ".verify!" do
     it "returns the locked quote when the checkout context matches" do
       result = described_class.create(line_items: line_items_for(product), canonical_total_cents: 10_00, ip: "24.48.0.1")
@@ -1196,6 +1388,105 @@ describe Checkout::BuyerCurrencyQuote do
           )
         end.to raise_error(described_class::InvalidToken, "expired buyer currency quote")
       end
+    end
+  end
+
+  describe "listed_currency_rate binding (gumroad-private#1958)" do
+    let(:eur_product) { create(:product, user: seller, price_cents: 10_00, price_currency_type: Currency::EUR) }
+
+    def eur_line_item(rate:)
+      purchase = build(:purchase, link: eur_product, seller:, purchase_state: "in_progress")
+      purchase.set_price_and_rate(locked_rate: rate)
+      posted_price_cents = purchase.total_transaction_cents
+
+      tax_result = double(price_cents: posted_price_cents, tax_cents: 0, zip_tax_rate: nil, used_taxjar: false, gumroad_is_mpf: false)
+      described_class::LineItem.from_surcharge(
+        permalink: eur_product.unique_permalink,
+        product: eur_product,
+        tax_result:,
+        tip_cents: 0,
+        shipping_usd_cents: 0,
+        listed_currency_rate: rate
+      )
+    end
+
+    it "binds the listed-currency rate used at quote time into the signed token" do
+      line_item = eur_line_item(rate: "0.9")
+
+      result = described_class.create(line_items: [line_item], canonical_total_cents: line_item.canonical_total_cents, ip: "24.48.0.1")
+
+      expect(result.charges.sole.listed_currency_rates).to eq(eur_product.unique_permalink => "0.9")
+      expect(result.charges.sole.listed_currency_codes).to eq(eur_product.unique_permalink => Currency::EUR)
+    end
+
+    it "omits the rate for USD-listed lines" do
+      line_item = line_items_for(product).first
+
+      result = described_class.create(line_items: [line_item], canonical_total_cents: 10_00, ip: "24.48.0.1")
+
+      expect(result.charges.sole.listed_currency_rates).to eq({})
+      expect(result.charges.sole.listed_currency_codes).to eq({})
+    end
+
+    it "keeps the signed rate scalar for older app instances" do
+      line_item = eur_line_item(rate: "0.9")
+      created = described_class.create(line_items: [line_item], canonical_total_cents: line_item.canonical_total_cents, ip: "24.48.0.1")
+      payload = Rails.application.message_verifier(described_class::TOKEN_PURPOSE).verify(created.token)
+
+      expect(payload.dig("listed_currency_rates", eur_product.unique_permalink).to_d).to eq(BigDecimal("0.9"))
+      expect(payload.dig("listed_currency_codes", eur_product.unique_permalink)).to eq(Currency::EUR)
+    end
+
+    it "round-trips the rate through verify! so the charge path can read it back" do
+      line_item = eur_line_item(rate: "0.9")
+      created = described_class.create(line_items: [line_item], canonical_total_cents: line_item.canonical_total_cents, ip: "24.48.0.1")
+
+      verified = described_class.verify!(
+        token: created.token,
+        seller:,
+        merchant_account:,
+        currency: Currency::CAD,
+        canonical_total_cents: line_item.canonical_total_cents,
+        canonical_line_items: [{ permalink: eur_product.unique_permalink, total_cents: line_item.canonical_total_cents }]
+      )
+
+      expect(verified.listed_currency_rate_for(eur_product.unique_permalink, currency: Currency::EUR)).to eq(BigDecimal("0.9"))
+    end
+
+    it "returns the bound rate from listed_currency_rate_hint while the quote window is open" do
+      line_item = eur_line_item(rate: "0.9")
+      created = described_class.create(line_items: [line_item], canonical_total_cents: line_item.canonical_total_cents, ip: "24.48.0.1")
+
+      expect(described_class.listed_currency_rate_hint(token: created.token, seller_id: seller.id, permalink: eur_product.unique_permalink, currency: Currency::EUR))
+        .to eq(BigDecimal("0.9"))
+    end
+
+    it "returns nil from listed_currency_rate_hint when the product currency changed" do
+      line_item = eur_line_item(rate: "0.9")
+      created = described_class.create(line_items: [line_item], canonical_total_cents: line_item.canonical_total_cents, ip: "24.48.0.1")
+
+      expect(described_class.listed_currency_rate_hint(token: created.token, seller_id: seller.id, permalink: eur_product.unique_permalink, currency: Currency::GBP))
+        .to be_nil
+    end
+
+    it "returns nil from listed_currency_rate_hint once the quote window has passed" do
+      # Load-bearing on non-Stripe charges: PayPal never reaches verify!, so this expiry check
+      # is the only thing stopping a replayed old token from pricing a purchase at a stale rate.
+      line_item = eur_line_item(rate: "0.9")
+      created = described_class.create(line_items: [line_item], canonical_total_cents: line_item.canonical_total_cents, ip: "24.48.0.1")
+
+      travel_to(created.charges.sole.stripe_fx_quote_expires_at + 1.second) do
+        expect(described_class.listed_currency_rate_hint(token: created.token, seller_id: seller.id, permalink: eur_product.unique_permalink, currency: Currency::EUR))
+          .to be_nil
+      end
+    end
+
+    it "returns nil from listed_currency_rate_hint for a tampered token" do
+      expect(described_class.listed_currency_rate_hint(token: "garbage", seller_id: seller.id, permalink: "whatever", currency: Currency::EUR)).to be_nil
+    end
+
+    it "returns nil from listed_currency_rate_hint when no token is present" do
+      expect(described_class.listed_currency_rate_hint(token: nil, seller_id: seller.id, permalink: "whatever", currency: Currency::EUR)).to be_nil
     end
   end
 end

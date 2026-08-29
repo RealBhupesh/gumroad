@@ -22,7 +22,7 @@ import {
   Star,
   TwitterX,
 } from "@boxicons/react";
-import { findChildren, generateJSON, Node as TiptapNode } from "@tiptap/core";
+import { type Editor, findChildren, generateJSON, Node as TiptapNode } from "@tiptap/core";
 import { DOMSerializer } from "@tiptap/pm/model";
 import { EditorContent } from "@tiptap/react";
 import { parseISO } from "date-fns";
@@ -39,6 +39,7 @@ import {
   reconcileMountedEditorFileEmbeds,
   removedFileEmbedIdsForPage,
   resolveServerIdMapping,
+  scopedRichContentPageKey,
 } from "$app/data/product_edit";
 import { reorderRowsPreservingMembership } from "$app/data/product_save_contract";
 import { type Post } from "$app/types/workflow";
@@ -49,8 +50,14 @@ import { formatDate } from "$app/utils/date";
 import FileUtils from "$app/utils/file";
 import GuidGenerator from "$app/utils/guid_generator";
 import { getMimeType } from "$app/utils/mimetypes";
+import { isLikelyImageFile } from "$app/utils/prepareImageForUpload";
 import { assertResponseError, request, ResponseError } from "$app/utils/request";
 import { generatePageIcon } from "$app/utils/rich_content_page";
+import {
+  canResetFileInputAfterSnapshot,
+  fileListMatchesPickedFiles,
+  snapshotPickedFiles,
+} from "$app/utils/snapshotPickedFile";
 
 import { Button } from "$app/components/Button";
 import { InputtedDiscount } from "$app/components/CheckoutDashboard/DiscountInput";
@@ -69,6 +76,7 @@ import { ReviewForm } from "$app/components/ReviewForm";
 import {
   baseEditorOptions,
   getInsertAtFromSelection,
+  lastContentResetFailed,
   PopoverMenuItem,
   RichTextEditorToolbar,
   useImageUploadSettings,
@@ -114,6 +122,22 @@ declare global {
     ___dropbox_files_picked: DropboxFile[] | null;
   }
 }
+
+// "Reset requested, not yet confirmed" marker for the mounted-doc identity
+// guard. Distinct from undefined on purpose: undefined is the VALID no-page
+// selection, and conflating the two lets a write fire in the switch window to
+// an empty variant — addPage would copy the stale doc into it.
+const EDITOR_CONTENT_PENDING = Symbol("editor-content-pending");
+
+// Fallback node search for a stored doc the schema cannot parse: walks the
+// raw JSON so single-instance checks (license key) stay fail-closed even when
+// the doc also contains invalid nodes.
+export const rawDocContainsNode = (value: unknown, type: string): boolean => {
+  if (Array.isArray(value)) return value.some((child) => rawDocContainsNode(child, type));
+  if (typeof value !== "object" || value === null) return false;
+  if ("type" in value && value.type === type) return true;
+  return "content" in value && rawDocContainsNode(value.content, type);
+};
 
 export const extensions = (productId: string, extraExtensions: TiptapNode[] = []) => [
   ...extraExtensions,
@@ -175,7 +199,7 @@ const FileUploadMenu = ({
   </Menu>
 );
 
-const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | null }) => {
+export const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | null }) => {
   const {
     id,
     product,
@@ -200,11 +224,14 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
   const pages: (Page & { chosen?: boolean })[] = selectedVariant ? selectedVariant.rich_content : product.rich_content;
   const pagesRef = useRefToLatest(pages);
   const setPages = (nextPages: Page[]) =>
-    updateProduct((product) => {
-      if (selectedVariant) selectedVariant.rich_content = nextPages;
+    updateProduct((current) => {
+      const variant = current.has_same_rich_content_for_all_variants
+        ? undefined
+        : current.variants.find((item) => item.id === selectedVariantId);
+      if (variant) variant.rich_content = nextPages;
       else {
-        product.has_same_rich_content_for_all_variants = true;
-        product.rich_content = nextPages;
+        current.has_same_rich_content_for_all_variants = true;
+        current.rich_content = nextPages;
       }
     });
   // Only the sortable goes through this. Its report is a DOM-derived list, so a
@@ -213,16 +240,42 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
   // row (gumroad-private#1508). Intentional removals (the confirm modal, the
   // copy-from-version replacement) call setPages directly, so reconciliation
   // cannot resurrect what the seller actually deleted.
-  const reorderPages = (reportedPages: Page[]) =>
-    setPages(reorderRowsPreservingMembership(reportedPages, pagesRef.current));
+  const reorderPages = (reportedPages: Page[]) => {
+    const currentPages = pagesRef.current;
+    // A report whose ids are disjoint from this variant is the previous
+    // variant's list arriving late (Sortable layout vs a stale pagesRef).
+    // Adopting it would replace this tier's pages with another tier's.
+    if (
+      reportedPages.length > 0 &&
+      currentPages.length > 0 &&
+      reportedPages.every((row) => !currentPages.some((page) => page.id === row.id))
+    ) {
+      return;
+    }
+    setPages(reorderRowsPreservingMembership(reportedPages, currentPages));
+  };
   // Records that the seller explicitly deleted these pages, so the server-side
   // wipe guard allows removing them even though they may still have content.
+  // A STORED id another surviving page still carries is skipped: raw ids can
+  // repeat across scopes, and sending a shared stored id names the surviving
+  // page's row for deletion. Newly added pages' client ids record regardless
+  // (inert until reconciliation resolves them, which drops ambiguous cases).
   const confirmPageRemovals = (removedPages: Page[]) => {
     if (removedPages.length === 0) return;
     updateProduct((product) => {
+      const removed = new Set<Page>(removedPages);
+      const survivingPageIds = new Set(
+        [...product.rich_content, ...product.variants.flatMap((variant) => variant.rich_content)]
+          .filter((page) => !removed.has(page))
+          .map(({ id }) => id),
+      );
+      const removableIds = removedPages
+        .filter((page) => page.newlyAdded || !survivingPageIds.has(page.id))
+        .map(({ id }) => id);
+      if (removableIds.length === 0) return;
       product.confirmed_removed_rich_content_ids = [
         ...(product.confirmed_removed_rich_content_ids ?? []),
-        ...removedPages.map(({ id }) => id),
+        ...removableIds,
       ];
     });
   };
@@ -244,16 +297,27 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
   // selection keeps pointing at the same page instead of falling back to the
   // first one.
   const selectedPageId =
-    rawSelectedPageId == null ? rawSelectedPageId : resolveServerIdMapping(rawSelectedPageId, richContentIdMappings);
+    rawSelectedPageId == null
+      ? rawSelectedPageId
+      : (richContentIdMappings[scopedRichContentPageKey(selectedVariant?.id ?? null, rawSelectedPageId)] ??
+        resolveServerIdMapping(rawSelectedPageId, richContentIdMappings));
   const selectedPage = pages.find((page) => page.id === selectedPageId);
   if ((selectedPageId || pages.length) && !selectedPage) setSelectedPageId(pages[0]?.id);
   const [renamingPageId, setRenamingPageId] = React.useState<string | null>(null);
+  // A rename in progress names a page by raw id; after a variant switch that
+  // id can address a DIFFERENT page in the new variant. Close the rename
+  // instead of letting it carry over.
+  React.useEffect(() => setRenamingPageId(null), [selectedVariantId]);
   const [confirmingDeletePage, setConfirmingDeletePage] = React.useState<Page | null>(null);
   const [pagesExpanded, setPagesExpanded] = React.useState(false);
   const showPageList =
     pages.length > 1 || selectedPage?.title || renamingPageId != null || product.native_type === "commission";
   const [insertMenuState, setInsertMenuState] = React.useState<"open" | "inputs" | null>(null);
-  const initialValue = React.useMemo(() => selectedPage?.description ?? "", [selectedPageId]);
+  // Page identity is scope + id: two variants' pages can share a raw id
+  // before save reconciliation, so raw-id keys miss same-id variant switches.
+  const selectedScopedPageKey =
+    selectedPageId == null ? undefined : scopedRichContentPageKey(selectedVariant?.id ?? null, selectedPageId);
+  const initialValue = React.useMemo(() => selectedPage?.description ?? "", [selectedScopedPageKey]);
 
   const onSelectFiles = (ids: string[]) => {
     if (!editor) return;
@@ -272,7 +336,26 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
   };
   const uploader = assertDefined(useEvaporateUploader());
   const s3UploadConfig = useS3UploadConfig();
+  // An over-budget pick keeps the original File handle (see snapshotPickedFiles), and
+  // Evaporate re-slices that handle for every part, so the toolbar input can only be
+  // reset once each upload from the pick has completed or been cancelled.
+  const pendingFileInputResetRef = React.useRef<{ picked: File[]; uploadIds: Set<string> } | null>(null);
+  const [fileInputHeld, setFileInputHeld] = React.useState(false);
+  const fileInputHeldRef = React.useRef(false);
+  const holdFileInput = (held: boolean) => {
+    fileInputHeldRef.current = held;
+    setFileInputHeld(held);
+  };
+  const settleFileInputUpload = (fileId: string) => {
+    const pending = pendingFileInputResetRef.current;
+    if (!pending?.uploadIds.delete(fileId) || pending.uploadIds.size > 0) return;
+    pendingFileInputResetRef.current = null;
+    holdFileInput(false);
+    const input = fileInputRef.current;
+    if (input && fileListMatchesPickedFiles(input.files, pending.picked)) input.value = "";
+  };
   const uploadFiles = (files: File[]) => {
+    const scheduledIds: string[] = [];
     const fileEntries = files.map((file) => {
       const id = FileUtils.generateGuid();
       const { s3key, fileUrl } = s3UploadConfig.generateS3KeyForUpload(id, file.name);
@@ -310,6 +393,7 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
           updateProduct((product) => {
             product.files = [...product.files];
           });
+          settleFileInputUpload(id);
         },
         onProgress: (progress) => {
           fileStatus.uploadStatus = { type: "uploading", progress };
@@ -321,17 +405,44 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
       if (typeof status === "string") {
         // status contains error string if any, otherwise index of file in array
         showAlert(status, "error");
+      } else {
+        scheduledIds.push(id);
       }
       return fileEntry;
     });
     updateProduct({ files: [...product.files, ...fileEntries] });
     onSelectFiles(fileEntries.map((file) => file.id));
+    return scheduledIds;
   };
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const openToolbarFileInput = () => {
+    if (fileInputHeldRef.current || pendingFileInputResetRef.current) return;
+    fileInputRef.current?.click();
+  };
   const uploadFileInput = (input: HTMLInputElement) => {
-    if (!input.files?.length) return;
-    uploadFiles([...input.files]);
-    input.value = "";
+    // A second pick replaces this input's FileList; Chromium can revoke the
+    // original handles an in-flight over-budget upload still needs.
+    if (fileInputHeldRef.current || pendingFileInputResetRef.current || !input.files?.length) return;
+    const picked = [...input.files];
+    holdFileInput(true);
+    void snapshotPickedFiles(picked)
+      .then((files) => {
+        const uploadIds = uploadFiles(files);
+        if (!fileListMatchesPickedFiles(input.files, picked)) {
+          holdFileInput(false);
+          return;
+        }
+        // With no scheduled upload left, nothing holds the original handles and an
+        // immediate reset is safe.
+        if (canResetFileInputAfterSnapshot(picked, files) || uploadIds.length === 0) {
+          input.value = "";
+          holdFileInput(false);
+        } else pendingFileInputResetRef.current = { picked, uploadIds: new Set(uploadIds) };
+      })
+      .catch((error: unknown) => {
+        holdFileInput(false);
+        showAlert(error instanceof Error ? error.message : "Could not read the selected file.", "error");
+      });
   };
 
   const fileEmbedGroupConfig = useRefToLatest({
@@ -340,7 +451,7 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
     prepareDownload: save,
     filesById,
   });
-  const fileEmbedConfig = useRefToLatest<FileEmbedConfig>({ filesById });
+  const fileEmbedConfig = useRefToLatest<FileEmbedConfig>({ filesById, onUploadCancelled: settleFileInputUpload });
   const uploadFilesRef = useRefToLatest(uploadFiles);
   const contentEditorExtensions = extensions(id, [
     FileEmbedGroup.configure({ getConfig: () => fileEmbedGroupConfig.current }),
@@ -354,6 +465,27 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
     onInputNonImageFiles: (files) => uploadFilesRef.current(files),
   });
   const removedFileEmbedIds = removedFileEmbedIdsForPage(selectedPage, richContentRemovedFileEmbedIds);
+  // Which page the mounted doc actually belongs to (see updateContentRef).
+  // Queued after useRichTextEditor's reset microtask (hook order), and set
+  // only after a SUCCESSFUL reset: a failed reset leaves the wrong doc
+  // mounted, so writes stay blocked and the seller gets an explicit error.
+  const editorContentPageKeyRef = React.useRef<string | undefined | typeof EDITOR_CONTENT_PENDING>(
+    EDITOR_CONTENT_PENDING,
+  );
+  React.useEffect(() => {
+    // Invalidate synchronously: the mounted doc no longer matches the
+    // selection until the paired reset lands — a switch-back to the key the
+    // ref still holds must not inherit the old match.
+    editorContentPageKeyRef.current = EDITOR_CONTENT_PENDING;
+    queueMicrotask(() => {
+      if (!editor) return;
+      if (lastContentResetFailed(editor)) {
+        showAlert("This page's content could not be displayed. Reload the page before editing it.", "error");
+        return;
+      }
+      editorContentPageKeyRef.current = selectedScopedPageKey;
+    });
+  }, [selectedScopedPageKey, editor]);
   React.useEffect(() => {
     if (editor) reconcileMountedEditorFileEmbedIds(editor, fileIdMappings);
   }, [editor, fileIdMappings]);
@@ -368,6 +500,9 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
   }, [editor, removedFileEmbedIds]);
   const updateContentRef = useRefToLatest(() => {
     if (!editor) return;
+    // Mounted doc still belongs to the previous page during the switch window
+    // (gp#1943); skip rather than misfile it under the newly selected page.
+    if (editorContentPageKeyRef.current !== selectedScopedPageKey) return;
 
     // Correctly set the IDs of the file embeds copied from another product
     const fragment = DOMSerializer.fromSchema(editor.schema).serializeFragment(editor.state.doc.content);
@@ -399,19 +534,45 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
     };
   }, [editor]);
 
+  // A page whose stored doc the schema refuses must degrade to a plain page
+  // entry, not crash the whole tab at render — the guarded editor reset is
+  // what surfaces the failure when the page is selected.
+  const parsedPageDescription = (mountedEditor: Editor, page: Page) => {
+    try {
+      return mountedEditor.schema.nodeFromJSON(page.description);
+    } catch {
+      return null;
+    }
+  };
+
+  const findPageWithNode = (type: string) =>
+    editor &&
+    pages.find((page) => {
+      const description = parsedPageDescription(editor, page);
+      // Unparseable page: scan the raw JSON instead. Answering "not present"
+      // here would let single-instance nodes (the license key) be inserted a
+      // second time on a healthy page.
+      if (!description) return rawDocContainsNode(page.description, type);
+      return findChildren(description, (node) => node.type.name === type).length > 0;
+    });
+
   const pageIcons = React.useMemo(
     () =>
       new Map(
         editor
           ? pages.map((page) => {
-              const description = editor.schema.nodeFromJSON(page.description);
+              const description = parsedPageDescription(editor, page);
               return [
                 page.id,
                 generatePageIcon({
-                  hasLicense: findChildren(description, (node) => node.type.name === LicenseKey.name).length > 0,
-                  fileIds: findChildren(description, (node) => node.type.name === FileEmbed.name).map(({ node }) =>
-                    String(node.attrs.id),
-                  ),
+                  hasLicense: description
+                    ? findChildren(description, (node) => node.type.name === LicenseKey.name).length > 0
+                    : false,
+                  fileIds: description
+                    ? findChildren(description, (node) => node.type.name === FileEmbed.name).map(({ node }) =>
+                        String(node.attrs.id),
+                      )
+                    : [],
                   allFiles: product.files,
                 }),
               ] as const;
@@ -420,13 +581,6 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
       ),
     [pages],
   );
-
-  const findPageWithNode = (type: string) =>
-    editor &&
-    pages.find(
-      (page) =>
-        findChildren(editor.schema.nodeFromJSON(page.description), (node) => node.type.name === type).length > 0,
-    );
 
   const onInsertPosts = () => {
     if (!editor) return;
@@ -635,6 +789,7 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
         name="file"
         className="sr-only"
         multiple
+        disabled={fileInputHeld}
         onChange={(e) => uploadFileInput(e.target)}
       />
       <div className="h-screen sm:h-full md:flex md:flex-col">
@@ -651,7 +806,7 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
                   <FileUploadMenu
                     existingFiles={existingFiles}
                     onEmbedMedia={() => setShowEmbedModal(true)}
-                    onClickComputerFiles={() => fileInputRef.current?.click()}
+                    onClickComputerFiles={openToolbarFileInput}
                     onSelectExistingFiles={() => {
                       setSelectingExistingFiles({ selected: [], query: "", isLoading: true });
                       void fetchLatestExistingFiles();
@@ -757,13 +912,26 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
                           multiple
                           onChange={(e) => {
                             if (!e.target.files) return;
-                            const [images, nonImages] = partition([...e.target.files], (file) =>
-                              file.type.startsWith("image"),
-                            );
-                            uploadImages({ view: editor.view, files: images, imageSettings });
-                            uploadFiles(nonImages);
-                            e.target.value = "";
-                            setShowEmbedModal(false);
+                            const picked = [...e.target.files];
+                            const input = e.target;
+                            void snapshotPickedFiles(picked)
+                              .then((files) => {
+                                const [images, nonImages] = partition(files, (file: File) => isLikelyImageFile(file));
+                                uploadImages({ view: editor.view, files: images, imageSettings });
+                                uploadFiles(nonImages);
+                                if (
+                                  fileListMatchesPickedFiles(input.files, picked) &&
+                                  canResetFileInputAfterSnapshot(picked, files)
+                                )
+                                  input.value = "";
+                                setShowEmbedModal(false);
+                              })
+                              .catch((error: unknown) => {
+                                showAlert(
+                                  error instanceof Error ? error.message : "Could not read the selected file.",
+                                  "error",
+                                );
+                              });
                           }}
                         />
                         <ArrowUp pack="filled" className="size-5" />
@@ -926,7 +1094,10 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
                         <>
                           {pages.map((page) => (
                             <PageTab
-                              key={page.id}
+                              // Scoped key: PageTab's title editor never resets
+                              // on prop changes, so same-id pages across
+                              // variants need a remount.
+                              key={scopedRichContentPageKey(selectedVariant?.id ?? null, page.id)}
                               page={page}
                               selected={page === selectedPage}
                               icon={pageIcons.get(page.id) ?? "text-only"}
@@ -1049,7 +1220,7 @@ const ContentTabContent = ({ selectedVariantId }: { selectedVariantId: string | 
                         <FileUploadMenu
                           existingFiles={existingFiles}
                           onEmbedMedia={() => setShowEmbedModal(true)}
-                          onClickComputerFiles={() => fileInputRef.current?.click()}
+                          onClickComputerFiles={openToolbarFileInput}
                           onSelectExistingFiles={() => {
                             setSelectingExistingFiles({ selected: [], query: "", isLoading: true });
                             void fetchLatestExistingFiles();

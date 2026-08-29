@@ -4,6 +4,9 @@ require "zip/filesystem"
 
 class Link < ApplicationRecord
   has_paper_trail
+  ANALYTICS_SCRIPT_TOKEN_PURPOSE = :external_landing_page_script
+  ANALYTICS_VIEW_TOKEN_PURPOSE = :external_landing_page_view
+
   # Moving the definition of these flags will cause an error.
   include FlagShihTzu
   include ActionView::Helpers::SanitizeHelper
@@ -241,7 +244,9 @@ class Link < ApplicationRecord
   validate :one_coffee_per_user, if: -> { native_type == Link::NATIVE_TYPE_COFFEE && (new_record? || (archived_changed? && !archived?)) }
   validate :quantity_enabled_state_is_allowed
   validate :default_offer_code_must_be_valid
-  validate :content_moderation_check, if: -> { publishing? || (persisted? && published? && (name_changed? || description_changed?)) }
+  validate :content_moderation_check, if: -> {
+    !@content_moderation_checked_for_publish && (publishing? || (persisted? && published? && (name_changed? || description_changed?)))
+  }
 
   validates_associated :installment_plan, message: -> (link, _) { link.installment_plan.errors.full_messages.first }
 
@@ -502,31 +507,66 @@ class Link < ApplicationRecord
     enforce_shipping_destinations_presence!
     enforce_user_email_confirmation!
     enforce_merchant_account_exits_for_new_users!
+    transcode_after_publish = auto_transcode_videos?
+    caller_flags_change = changes["flags"]&.map(&:to_i)
+
     self.purchase_disabled_at = nil
     self.deleted_at = nil
     self.draft = false
     self.publishing = true
-    deadlock_retries = 0
+    caller_has_transaction = Link.connection.transaction_open?
+    transaction_committed = false
+    lock_retries = 0
     begin
-      if auto_transcode_videos?
-        transcode_videos!
-      else
-        enable_transcode_videos_on_purchase!
+      errors.clear
+      content_moderation_check
+      raise ActiveRecord::RecordInvalid, self if errors.any?
+
+      @content_moderation_checked_for_publish = true
+      Link.transaction do
+        AfterCommitEverywhere.after_commit { transaction_committed = true } unless caller_has_transaction
+        current_flags = Link.where(id:).lock.pick(:flags).to_i
+        if caller_flags_change
+          # Merge only the caller's changed bits because all Link flags share one column.
+          previous_flags, requested_flags = caller_flags_change
+          changed_bits = previous_flags ^ requested_flags
+          self.flags = (current_flags & ~changed_bits) | (requested_flags & changed_bits)
+        else
+          self.flags = current_flags
+        end
+        self.transcode_videos_on_purchase = true
+        save!
+
+        if transcode_after_publish
+          product_id = id
+          AfterCommitEverywhere.after_commit do
+            product = Link.find(product_id)
+            product.transcode_videos!
+            product.update_flag!(:transcode_videos_on_purchase, false, true)
+          rescue StandardError => error
+            ErrorNotifier.notify(error, product_id:)
+          end
+        end
+
+        unless is_collab?
+          user.direct_affiliates.alive.apply_to_all_products.order(:id).each do |affiliate|
+            next unless ProductAffiliate.create_if_missing!(affiliate:, product: self)
+
+            affiliate_id = affiliate.id
+            product_id = id
+            AfterCommitEverywhere.after_commit do
+              AffiliateMailer.notify_direct_affiliate_of_new_product(affiliate_id, product_id).deliver_later
+            end
+          end
+        end
       end
-      save!
-    rescue ActiveRecord::Deadlocked
-      deadlock_retries += 1
-      retry if deadlock_retries <= 2
+    rescue ActiveRecord::Deadlocked, ActiveRecord::LockWaitTimeout
+      lock_retries += 1
+      retry if lock_retries <= 2 && !caller_has_transaction && !transaction_committed
       raise
     ensure
+      @content_moderation_checked_for_publish = false
       self.publishing = false
-    end
-
-    user.direct_affiliates.alive.apply_to_all_products.each do |affiliate|
-      unless affiliate.products.include?(self)
-        affiliate.products << self
-        AffiliateMailer.notify_direct_affiliate_of_new_product(affiliate.id, id).deliver_later
-      end
     end
   end
 
@@ -857,6 +897,32 @@ class Link < ApplicationRecord
 
   def self.fetch(unique_permalink, user: nil)
     Link.by_user(user).visible.find_by(unique_permalink:)
+  end
+
+  def analytics_script_token
+    self.class.analytics_view_verifier.generate({ product_id: id }, purpose: ANALYTICS_SCRIPT_TOKEN_PURPOSE)
+  end
+
+  def analytics_script_token?(token)
+    payload = self.class.analytics_view_verifier.verified(token.to_s, purpose: ANALYTICS_SCRIPT_TOKEN_PURPOSE)
+    payload.is_a?(Hash) && payload["product_id"] == id
+  end
+
+  def analytics_view_token(source_url:, event_id: SecureRandom.uuid)
+    self.class.analytics_view_verifier.generate({ product_id: id, source_url: source_url.to_s, event_id: }, purpose: ANALYTICS_VIEW_TOKEN_PURPOSE, expires_in: 10.minutes)
+  end
+
+  def analytics_view_token?(token, source_url:)
+    analytics_view_token_payload(token, source_url:).present?
+  end
+
+  def analytics_view_token_payload(token, source_url:)
+    payload = self.class.analytics_view_verifier.verified(token.to_s, purpose: ANALYTICS_VIEW_TOKEN_PURPOSE)
+    payload if payload.is_a?(Hash) && payload["product_id"] == id && payload["source_url"] == source_url.to_s && payload["event_id"].present?
+  end
+
+  def self.analytics_view_verifier
+    Rails.application.message_verifier(:product_analytics_view)
   end
 
   def can_gift?
@@ -1259,7 +1325,13 @@ class Link < ApplicationRecord
   end
 
   def gumroad_amount_for_paypal_order(amount_cents:, affiliate_id: nil, vat_cents: 0, was_recommended: false)
-    fee_per_thousand = Purchase::GUMROAD_FLAT_FEE_PER_THOUSAND
+    # Volume rate applies to direct sales only (recommended keeps the full discover
+    # rate). This path has always ignored custom_fee_per_thousand; unchanged here.
+    fee_per_thousand = if !was_recommended && user.high_volume_seller_fee?
+      User::HIGH_VOLUME_FEE_PER_THOUSAND
+    else
+      Purchase::GUMROAD_FLAT_FEE_PER_THOUSAND
+    end
 
     if was_recommended
       gumroad_fee_cents = (amount_cents * (fee_per_thousand + discover_fee_per_thousand - Purchase::GUMROAD_DISCOVER_EXTRA_FEE_PER_THOUSAND)) / 1000

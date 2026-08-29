@@ -20,7 +20,8 @@ class CustomerMailer < ApplicationMailer
   # because every caller of this mailer is a self-serve flow the buyer can re-trigger.
   GROUPED_RECEIPT_SEND_CLAIM_TTL = 24.hours
 
-  def grouped_receipt(purchase_ids)
+  def grouped_receipt(purchase_ids, recommendations: true)
+    @recommendations = recommendations
     # Callers can pass ids of purchases in any state (e.g. the email-reassignment flow
     # moves failed purchases too). A failed purchase that belongs to a Charge resolves
     # to a Charge with no successful purchases, and the receipt template crashes with
@@ -47,16 +48,16 @@ class CustomerMailer < ApplicationMailer
     )
   end
 
-  # Note that the first argument is purchase_id, while the 2nd is charge_id
-  # charge_id needs to be passed to the mailer only when the initial customer order is placed (via SendChargeReceiptJob)
-  # For duplicate receipts (post-purchase), the purchase_id is passed, and the mailer will determine if it should use the
-  # purchase, or the charge associated (via Charge::Chargeable.find_by_purchase_or_charge!)
-  #
-  def receipt(purchase_id = nil, charge_id = nil, for_email: true)
-    @chargeable = Charge::Chargeable.find_by_purchase_or_charge!(
-      purchase: Purchase.find_by(id: purchase_id),
-      charge: Charge.find_by(id: charge_id)
-    )
+  def receipt(purchase_id = nil, charge_id = nil, for_email: true, single_purchase: false)
+    purchase = Purchase.find_by(id: purchase_id)
+    @chargeable = if single_purchase || purchase&.split_charge_receipt_sent?
+      purchase
+    else
+      Charge::Chargeable.find_by_purchase_or_charge!(
+        purchase:,
+        charge: Charge.find_by(id: charge_id)
+      )
+    end
     @email_name = __method__
 
     @receipt_presenter = ReceiptPresenter.new(@chargeable, for_email:)

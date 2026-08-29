@@ -6,6 +6,9 @@ class UsersController < ApplicationController
 
   include PageMeta::Favicon, PageMeta::User
   include RendersCustomHtmlPages
+  include CurrencyHelper
+
+  self.buyer_currency_footer_actions = %w[show coffee].freeze
 
   before_action :authenticate_user!, except: %i[show coffee subscribe subscribe_preview email_unsubscribe add_purchase_to_library session_info current_user_data landing_iframe_content landing_version landing_products]
 
@@ -49,7 +52,7 @@ class UsersController < ApplicationController
     # Skipped for pages that reference no price: the build is uncached, per-request work for up
     # to Pages::ProfileData::MAX_ITEMS products, and a page with no reference cannot consume it.
     prices_referenced = Pages::ProductPrices.referenced_in?(@user.custom_html)
-    prices = prices_referenced ? Pages::ProductPrices.build(@user, ip: request.remote_ip) : {}
+    prices = prices_referenced ? Pages::ProductPrices.build(@user, ip: request.remote_ip, preferred_currency: buyer_currency_preference(request)) : {}
     interpolated = Pages::Interpolator.interpolate_profile(@user.custom_html, profile: @user, prices:)
     render html: profile_custom_html_document(
       interpolated,
@@ -117,6 +120,7 @@ class UsersController < ApplicationController
 
   def subscribe
     set_user_page_meta(@user)
+    set_favicon_meta_tags(@user)
     set_meta_tag(title: "Subscribe to #{@user.name.presence || @user.username}")
     render inertia: "Users/Subscribe", props: {
       creator_profile: ProfilePresenter.new(pundit_user:, seller: @user).creator_profile
@@ -129,6 +133,7 @@ class UsersController < ApplicationController
     render inertia: "Users/SubscribePreview", props: {
       avatar_url: @user.resized_avatar_url(size: 240),
       title: @user.name_or_username,
+      bio: @user.bio.presence,
     }
   end
 
@@ -297,6 +302,14 @@ class UsersController < ApplicationController
       avatar_url = user.avatar_url if user.avatar.attached?
       share_image = preview_url || avatar_url || ActionController::Base.helpers.image_url("opengraph_image.png")
       escaped_share_image = ERB::Util.h(share_image)
+      # This <head> is hand-built (bypasses PageMeta::Favicon). user.avatar_url
+      # always resolves — to the default avatar when none is uploaded — so
+      # this always emits a seller-scoped icon.
+      favicon_url = ERB::Util.h(user.avatar_url)
+      favicon_tags = <<~HTML.strip
+        <link rel="shortcut icon" href="#{favicon_url}">
+        <link rel="apple-touch-icon" href="#{favicon_url}">
+      HTML
       alt = if preview_url
         title
       elsif avatar_url
@@ -337,6 +350,7 @@ class UsersController < ApplicationController
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <title>#{title}</title>
             <link rel="canonical" href="#{canonical}">
+            #{favicon_tags}
             <meta property="og:title" content="#{title}">
             <meta property="og:type" content="profile">
             <meta property="og:url" content="#{canonical}">

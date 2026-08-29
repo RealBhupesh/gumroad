@@ -20,7 +20,7 @@ class Purchase::CreateService < Purchase::BaseService
 
   def perform
     unless @product.allow_parallel_purchases?
-      inventory_semaphore = SuoSemaphore.product_inventory(@product.id, acquisition_timeout: INVENTORY_LOCK_ACQUISITION_TIMEOUT)
+      inventory_semaphore = inventory_lock_client
       inventory_lock_token = inventory_semaphore.lock
       if inventory_lock_token.nil?
         Rails.logger.warn("Could not acquire lock for product_inventory semaphore (product id: #{@product.id})")
@@ -68,7 +68,7 @@ class Purchase::CreateService < Purchase::BaseService
 
       # build pre-order if purchase is for pre-order product & return
       if purchase.is_preorder_authorization
-        build_preorder
+        build_preorder(locked_rate: buyer_currency_quote_rate_hint(purchase))
         return purchase, nil
       elsif product.is_in_preorder_state?
         # This should never happen unless the request is tampered with:
@@ -150,7 +150,7 @@ class Purchase::CreateService < Purchase::BaseService
 
       validate_bundle_products
 
-      purchase.prepare_for_charge!
+      purchase.prepare_for_charge!(locked_rate: buyer_currency_quote_rate_hint(purchase))
 
       purchase.build_purchase_wallet_type(wallet_type: params[:wallet_type]) if params[:wallet_type].present?
 
@@ -206,8 +206,32 @@ class Purchase::CreateService < Purchase::BaseService
   end
 
   private
+    # Every processor may use this signature- and expiry-checked hint while building the purchase.
+    # Stripe later performs the full amount verification; PayPal discards the token after the hint,
+    # which makes expiry the only bound on its pricing use (gumroad-private#1958).
+    def buyer_currency_quote_rate_hint(purchase)
+      return if params[:buyer_currency_quote].blank?
+      return unless purchase.link.price_currency_type.to_s.downcase != Currency::USD
+
+      Checkout::BuyerCurrencyQuote.listed_currency_rate_hint(
+        token: params[:buyer_currency_quote],
+        seller_id: purchase.seller.id,
+        permalink: purchase.link.unique_permalink,
+        currency: purchase.link.price_currency_type
+      )
+    end
+
     def is_gift?
       !!params[:is_gift]
+    end
+
+    def inventory_lock_client
+      extra = { acquisition_timeout: INVENTORY_LOCK_ACQUISITION_TIMEOUT }
+      if @product.native_type == Link::NATIVE_TYPE_CALL
+        SuoSemaphore.seller_call_inventory(@product.user_id, extra)
+      else
+        SuoSemaphore.product_inventory(@product.id, extra)
+      end
     end
 
     def should_check_for_restartable_subscription?
@@ -492,14 +516,14 @@ class Purchase::CreateService < Purchase::BaseService
       giftee_purchaser&.email || gift_params[:giftee_email]
     end
 
-    def build_preorder
+    def build_preorder(locked_rate: nil)
       raise Purchase::PurchaseInvalid, "The product was just released. Refresh the page to purchase it." unless product.is_in_preorder_state?
 
       self.preorder = product.preorder_link.build_preorder(purchase)
       if purchase.is_part_of_combined_charge?
-        purchase.prepare_for_charge!
+        purchase.prepare_for_charge!(locked_rate:)
       else
-        preorder.authorize!
+        preorder.authorize!(locked_rate:)
         error_message = preorder.errors.full_messages[0]
         if purchase.is_test_purchase?
           preorder.mark_test_authorization_successful!

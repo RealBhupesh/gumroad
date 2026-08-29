@@ -423,7 +423,7 @@ class Installment < ApplicationRecord
     end
   end
 
-  def send_installment_from_workflow_for_purchase(purchase_id)
+  def send_installment_from_workflow_for_purchase(purchase_id, reschedule_reference_time: nil)
     sale = Purchase.find(purchase_id)
     return if sale.is_recurring_subscription_charge
     # Cancellation posts are delivered on the subscription path, which rechecks the membership
@@ -435,20 +435,17 @@ class Installment < ApplicationRecord
     return if sale.chargedback_not_reversed_or_refunded?
     return if sale.subscription.present? && !sale.subscription.alive?
 
-    other_purchase_ids = Purchase.where(email: sale.email, seller_id: sale.seller_id)
-                                 .all_success_states
-                                 .no_or_active_subscription
-                                 .not_fully_refunded
-                                 .not_chargedback_or_chargedback_reversed
-                                 .pluck(:id)
-    return if other_purchase_ids.present? && CreatorContactingCustomersEmailInfo.where(purchase: other_purchase_ids, installment: id).present?
+    return if already_emailed_workflow_purchase?(sale)
 
     return if workflow.present? && !workflow.applies_to_purchase?(sale)
     expected_delivery_time_for_sale = expected_delivery_time(sale)
     if Time.current < expected_delivery_time_for_sale
       # reschedule for later if it's too soon to send (only applicable for subscriptions
       # that have been terminated and later restarted)
-      SendWorkflowInstallmentWorker.perform_at(expected_delivery_time_for_sale + 1.minute, id, installment_rule.version, sale.id, nil)
+      args = [id, installment_rule.version, sale.id, nil]
+      args.push(nil, nil, reschedule_reference_time) if reschedule_reference_time.present?
+      worker = reschedule_reference_time.present? ? SendWorkflowInstallmentRescheduleJob : SendWorkflowInstallmentWorker
+      worker.perform_at(expected_delivery_time_for_sale + 1.minute, *args)
     else
       SentPostEmail.ensure_uniqueness(post: self, email: sale.email) do
         recipient = { email: sale.email, purchase: sale }
@@ -469,13 +466,7 @@ class Installment < ApplicationRecord
     return unless sale.can_contact?
     return if sale.chargedback_not_reversed_or_refunded?
 
-    other_purchase_ids = Purchase.where(email: sale.email, seller_id: sale.seller_id)
-                                 .all_success_states
-                                 .inactive_subscription
-                                 .not_fully_refunded
-                                 .not_chargedback_or_chargedback_reversed
-                                 .pluck(:id)
-    return if other_purchase_ids.present? && CreatorContactingCustomersEmailInfo.where(purchase: other_purchase_ids, installment: id).present?
+    return if already_emailed_workflow_purchase?(sale, subscription_scope: :inactive_subscription)
 
     return if workflow.present? && !workflow.applies_to_purchase?(sale)
 
@@ -766,9 +757,13 @@ class Installment < ApplicationRecord
   end
 
   def unique_open_count
-    Rails.cache.fetch(key_for_cache(:unique_open_count)) do
-      CreatorEmailOpenEvent.where(installment_id: id).count
-    end
+    # DDB GetItem is cheap; caching it pins a first-read zero while opens still stream in.
+    dynamo_engagement_summary[:open_count]
+  end
+
+  # One SUMMARY read serves both counters when a render misses both caches.
+  private def dynamo_engagement_summary
+    @dynamo_engagement_summary ||= EmailEngagementDynamoStore.summary(id)
   end
 
   # How many email_infos rows to read at a time when working out who a post was emailed
@@ -857,20 +852,13 @@ class Installment < ApplicationRecord
   end
 
   def unique_click_count
-    Rails.cache.fetch(key_for_cache(:unique_click_count)) do
-      summary = CreatorEmailClickSummary.where(installment_id: id).last
-      summary.present? ? summary[:total_unique_clicks] : 0
-    end
+    dynamo_engagement_summary[:click_pair_count]
   end
 
-  # Return a breakdown of clicks by url.
   def clicked_urls
-    summary = CreatorEmailClickSummary.where(installment_id: id).last
-    return {} if summary.blank?
-
-    # Change urls back into human-readable format (Necessary because Mongo keys cannot contain ".") Also remove leading protocol & www
-    summary.urls.keys.each { |k| summary.urls[k.gsub(/&#46;/, ".").sub(%r{^https?://}, "").sub(/^www./, "")] = summary.urls.delete(k) }
-    Hash[summary.urls.sort_by { |_, v| v }.reverse] # Sort by number of clicks.
+    counts = EmailEngagementDynamoStore.url_click_counts(id)
+    return {} if counts.blank?
+    counts.sort_by { |_, v| -v }.to_h
   end
 
   # Public: Returns the percentage of email opens for this installment, or nil if one cannot be calculated.
@@ -1072,6 +1060,13 @@ class Installment < ApplicationRecord
     Time.current >= expected_delivery_time(purchase)
   end
 
+  def workflow_delivery_reference_time(purchase)
+    subscription = purchase.subscription
+    return purchase.created_at unless workflow.present? && subscription.present? && subscription.resubscribed?
+
+    purchase.created_at + (subscription.last_resubscribed_at - subscription.last_deactivated_at)
+  end
+
   class InstallmentInvalid < StandardError
   end
 
@@ -1102,12 +1097,7 @@ class Installment < ApplicationRecord
     def expected_delivery_time(sale)
       return sale.created_at unless installment_rule.present?
 
-      original_delivery_time = sale.created_at + installment_rule.delayed_delivery_time
-      subscription = sale.subscription
-      return original_delivery_time unless workflow.present? && subscription.present? && subscription.resubscribed?
-
-      send_delay = subscription.last_resubscribed_at - subscription.last_deactivated_at
-      original_delivery_time + send_delay
+      workflow_delivery_reference_time(sale) + installment_rule.delayed_delivery_time
     end
 
     def validate_sending_limit_for_sellers
@@ -1157,6 +1147,17 @@ class Installment < ApplicationRecord
 
       errors.add(:base, "You have to confirm your email address before you can do that.")
       raise InstallmentInvalid, "You have to confirm your email address before you can do that."
+    end
+
+    # Start from this installment's email_infos. The old email+seller pluck scanned
+    # every purchase for the buyer on each of ~100k workers.
+    def already_emailed_workflow_purchase?(sale, subscription_scope: :no_or_active_subscription)
+      purchase_scope = Purchase.where(email: sale.email, seller_id: sale.seller_id)
+                               .all_success_states
+                               .public_send(subscription_scope)
+                               .not_fully_refunded
+                               .not_chargedback_or_chargedback_reversed
+      CreatorContactingCustomersEmailInfo.where(installment_id: id).joins(:purchase).merge(purchase_scope).exists?
     end
 
     def send_email(recipient)

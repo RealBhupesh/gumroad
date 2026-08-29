@@ -299,6 +299,7 @@ class Purchase < ApplicationRecord
                                                                                                                                  }
     after_transition any => :successful, :do => :block_fraudulent_free_purchases!
     after_transition any => %i[successful not_charged gift_receiver_purchase_successful], :do => :schedule_order_review_reminder
+    after_transition any => NON_GIFT_SUCCESS_STATES.map(&:to_sym), :do => :schedule_indian_card_mandate_registration_check
     after_transition any => any, :do => :log_transition
 
     # normal purchase transitions:
@@ -410,6 +411,17 @@ class Purchase < ApplicationRecord
 
   after_commit :enqueue_update_sales_related_products_infos_job, if: -> (purchase) {
     purchase.purchase_state_previously_changed? && purchase.purchase_state == "successful"
+  }
+
+  after_commit :enqueue_high_volume_fee_eligibility_refresh, if: -> (purchase) {
+    purchase.purchase_state_previously_changed? && purchase.purchase_state == "successful"
+  }
+
+  # Refunds and failed-refund reversals flip stripe_refunded without touching
+  # purchase_state. Refresh synchronously: async would let a sale land on the stale
+  # cached rate until the low queue drains. Cheap because refunds are rare.
+  after_commit :refresh_high_volume_fee_eligibility, if: -> (purchase) {
+    purchase.stripe_refunded_previously_changed?
   }
 
   after_commit :enqueue_record_order_charge_outcome, if: -> (purchase) {
@@ -636,6 +648,10 @@ class Purchase < ApplicationRecord
             # UsersController#add_purchase_to_library), and #attach_to_user_and_card.
             # Not a buyer-level block (see is_buyer_blocked_by_admin).
             32 => :is_reassignment_locked,
+            33 => :is_indian_card_mandate_registration,
+            34 => :indian_card_mandate_missing,
+            35 => :indian_card_mandate_inactive,
+            36 => :indian_card_mandate_pending,
             :column => "flags",
             :flag_query_mode => :bit_operator,
             check_for_column: false
@@ -1684,10 +1700,26 @@ class Purchase < ApplicationRecord
     purchase_presentment.present?
   end
 
-  # True while a presentment purchase has been charged but Stripe settlement data has not
+  # True while a processor-backed purchase has been charged but settlement data has not
   # arrived yet; a finalization job completes the purchase once it does.
+  def pending_processor_settlement?
+    in_progress? && stripe_transaction_id.present? && processor_settlement_deferrable? && flow_of_funds.blank?
+  end
+
   def pending_buyer_presentment_settlement?
-    in_progress? && stripe_transaction_id.present? && (buyer_presentment? || charge&.charge_presentment.present?) && flow_of_funds.blank?
+    pending_processor_settlement?
+  end
+
+  def processor_settlement_deferrable?
+    return false unless stripe_charge_processor?
+
+    # Charge merchant_account is the money's home when the Charge exists; a nil
+    # purchase account (or a leftover Gumroad account on a seller-held charge)
+    # must not disagree with checkout/finalizer gates.
+    buyer_presentment? ||
+      charge&.charge_presentment.present? ||
+      !funds_held_by_gumroad? ||
+      settlement_merchant_account.nil?
   end
 
   def buyer_presentment_currency
@@ -2100,12 +2132,15 @@ class Purchase < ApplicationRecord
     after_commit do
       next if destroyed?
       AffiliateMailer.notify_affiliate_of_sale(id).deliver_later
+    rescue => e
+      Rails.logger.error("Failed to enqueue affiliate sale notification for purchase_id=#{id} affiliate_id=#{affiliate_id}: #{e.class}: #{e.message}")
     end
   end
 
   def create_product_affiliate
-    return unless affiliate.present? && affiliate.global? && link.product_affiliates.where(affiliate_id: affiliate.id).none?
-    link.affiliates << affiliate
+    return unless affiliate.present? && affiliate.global?
+
+    ProductAffiliate.create_if_missing!(affiliate:, product: link)
   end
 
   def create_url_redirect_for_failed_purchase
@@ -2369,8 +2404,8 @@ class Purchase < ApplicationRecord
   #
   #                    if set to `false`, it means we have a user in session and if charge requires further authentication,
   #                    the method should succeed and attach a `charge_intent` with `requires_action? == true`.
-  def process!(off_session: true)
-    prepare_for_charge!
+  def process!(off_session: true, locked_rate: nil)
+    prepare_for_charge!(locked_rate:)
     charge!(off_session:)
   end
 
@@ -2381,7 +2416,9 @@ class Purchase < ApplicationRecord
     return if errors.present?
 
     if charge_intent.succeeded?
-      charge_data_saved = save_charge_data(charge_intent.charge, chargeable:, allow_missing_flow_of_funds: buyer_presentment?)
+      charge_data_saved = save_charge_data(charge_intent.charge,
+                                           chargeable:,
+                                           allow_missing_flow_of_funds: processor_settlement_deferrable?)
       unless charge_data_saved
         FinalizeBuyerPresentmentPurchaseJob.perform_in(FinalizeBuyerPresentmentPurchaseJob::INITIAL_DELAY, id)
       end
@@ -2400,10 +2437,10 @@ class Purchase < ApplicationRecord
     self.charge_intent = ChargeProcessor.confirm_payment_intent!(merchant_account, processor_payment_intent_id)
 
     if charge_intent.succeeded?
-      # Presentment charges may not have Stripe settlement data yet right after an SCA
-      # confirmation; defer like the create path does instead of crashing on a blank
+      # Presentment and seller-held Stripe charges may not have settlement data yet right after an
+      # SCA confirmation; defer like the create path does instead of crashing on a blank
       # flow of funds. FinalizeBuyerPresentmentChargeJob completes the purchase later.
-      save_charge_data(charge_intent.charge, allow_missing_flow_of_funds: charge&.charge_presentment.present?)
+      save_charge_data(charge_intent.charge, allow_missing_flow_of_funds: processor_settlement_deferrable?)
     else
       errors.add :base, "Sorry, something went wrong."
     end
@@ -2474,7 +2511,7 @@ class Purchase < ApplicationRecord
     Purchase::MarkFailedService.new(self).perform
   end
 
-  def set_price_and_rate
+  def set_price_and_rate(locked_rate: nil)
     if once_per_cart_discount_allocation.present? && !has_cached_offer_code?
       allocated_offer_code = OfferCode.find_by(id: once_per_cart_discount_allocation[:offer_code_id])
       if allocated_offer_code&.is_cents? && allocated_offer_code.once_per_cart?
@@ -2512,8 +2549,12 @@ class Purchase < ApplicationRecord
 
     self.displayed_price_cents = determine_customized_price_cents || calculate_price_range_cents || minimum_paid_price_cents
     self.displayed_price_currency_type = link.price_currency_type
-    self.price_cents = displayed_price_usd_cents
-    self.rate_converted_to_usd = get_rate(displayed_price_currency_type)
+    # Reusing the quote's bound rate here (rather than a fresh `get_rate`) keeps this
+    # purchase's total in agreement with what BuyerCurrencyQuote.verify! signed
+    # (gumroad-private#1958) — a cache refresh between quote and charge would otherwise
+    # disagree with the token by a few cents and fail closed as buyer_currency_quote_invalid.
+    self.price_cents = locked_rate.present? ? get_usd_cents(displayed_price_currency_type, displayed_price_cents, rate: locked_rate) : displayed_price_usd_cents
+    self.rate_converted_to_usd = locked_rate.present? ? locked_rate.to_s : get_rate(displayed_price_currency_type)
     self.total_transaction_cents = self.price_cents
     self.affiliate_credit_cents = determine_affiliate_balance_cents
     self.tax_cents = 0
@@ -2539,12 +2580,12 @@ class Purchase < ApplicationRecord
     )
   end
 
-  def prepare_for_charge!
+  def prepare_for_charge!(locked_rate: nil)
     reservable_offer_code = offer_code if offer_code&.is_cents? && offer_code.once_per_cart? &&
       offer_code.max_purchase_count.present? &&
       !does_not_count_towards_max_purchases && !is_test_purchase?
 
-    self.chargeable = process_without_charging!(reservable_offer_code:)
+    self.chargeable = process_without_charging!(reservable_offer_code:, locked_rate:)
   end
 
   def update_balance_and_mark_successful!
@@ -3482,6 +3523,28 @@ class Purchase < ApplicationRecord
     purchase_state == "failed" || stripe_error_code.present? || (error_code.present? && PurchaseErrorCode::PAYMENT_ERROR_CODES.include?(error_code))
   end
 
+  def indian_card_mandate_error_status
+    return unless india_card_mandate_reliability_enabled?
+    return unless credit_card&.requires_mandate?
+
+    code = [error_code, stripe_error_code].compact.find do |value|
+      value.in?([
+                  PurchaseErrorCode::INDIA_CARD_MANDATE_MISSING,
+                  PurchaseErrorCode::INDIA_CARD_MANDATE_INACTIVE,
+                  PurchaseErrorCode::INDIA_CARD_MANDATE_PENDING,
+                  "payment_intent_mandate_invalid",
+                  "india_recurring_payment_mandate_canceled",
+                ])
+    end
+    {
+      PurchaseErrorCode::INDIA_CARD_MANDATE_MISSING => "missing",
+      PurchaseErrorCode::INDIA_CARD_MANDATE_INACTIVE => "inactive",
+      PurchaseErrorCode::INDIA_CARD_MANDATE_PENDING => "pending",
+      "payment_intent_mandate_invalid" => "inactive",
+      "india_recurring_payment_mandate_canceled" => "inactive",
+    }[code]
+  end
+
   def has_retryable_payment_error?
     PurchaseErrorCode.is_error_retryable?(error_code) ||
       PurchaseErrorCode.is_error_retryable?(stripe_error_code)
@@ -3638,6 +3701,32 @@ class Purchase < ApplicationRecord
     UpdateSalesRelatedProductsInfosJob.perform_async(id, increment)
   end
 
+  def enqueue_high_volume_fee_eligibility_refresh
+    return if seller_id.blank?
+
+    # A sale that crosses $20k must lower the very next sale's fee, so refresh
+    # synchronously while the seller is below the cached threshold. Already-eligible
+    # sellers can't change state on a sale; flag-off keeps the async pre-warm.
+    # Reload before branching: a concurrent refund can clear the cached eligibility
+    # this in-memory seller still shows, which would wrongly skip the sync refresh.
+    if seller && Feature.active?(:high_volume_seller_fee, seller) && !seller.reload.high_volume_fee_eligible?
+      refresh_high_volume_fee_eligibility
+    else
+      RefreshHighVolumeSellerFeeEligibilityJob.perform_async(seller_id)
+    end
+  end
+
+  def refresh_high_volume_fee_eligibility
+    return if seller.nil?
+
+    seller.refresh_high_volume_fee_eligibility!
+  rescue => e
+    # Never fail the refund or the sale over the fee cache; fall back to the async repair.
+    # Do not enqueue a blank seller_id — that is the job's nightly full-fleet sentinel.
+    Rails.logger.error("high_volume_fee sync refresh failed for seller #{seller_id}: #{e.message}")
+    RefreshHighVolumeSellerFeeEligibilityJob.perform_async(seller_id) if seller_id.present?
+  end
+
   def free_purchase?
     price_cents == 0 && shipping_cents == 0
   end
@@ -3740,6 +3829,7 @@ class Purchase < ApplicationRecord
   # only surfaces a year later as an unexplainable renewal decline. Report it at
   # registration time instead, so the affected subscriptions are visible immediately.
   def check_indian_card_mandate_was_registered(processor_charge)
+    return if india_card_mandate_reliability_enabled?
     return unless stripe_charge_processor?
     return unless credit_card&.requires_mandate?
     # Only the purchase that registers the recurring payment is expected to carry a mandate.
@@ -3756,6 +3846,125 @@ class Purchase < ApplicationRecord
   rescue => e
     # This check is observability only; never let it break charge processing.
     ErrorNotifier.notify(e, purchase: external_id)
+  end
+
+  def mark_indian_card_mandate_registration!
+    return unless india_card_mandate_reliability_enabled?
+    return if is_indian_card_mandate_registration?
+
+    update_flag!(:is_indian_card_mandate_registration, true, true)
+    clear_flags_change
+  end
+
+  def verify_indian_card_mandate_registration!
+    return unless india_card_mandate_reliability_enabled?
+    return unless is_indian_card_mandate_registration?
+    return unless credit_card&.requires_mandate?
+
+    mandate, status = retrieve_indian_card_mandate
+    record_indian_card_mandate_status!(status, mandate_id: mandate&.id)
+    mandate
+  end
+
+  def retrieve_indian_card_mandate
+    source_payment_method_id = nil
+    mandate_id = if processor_setup_intent_id.present?
+      setup_intent = ChargeProcessor.get_setup_intent(merchant_account, processor_setup_intent_id)
+      raise "Indian card mandate check found an incomplete SetupIntent" unless setup_intent&.succeeded?
+
+      source_payment_method_id = setup_intent.payment_method_id
+      setup_intent.mandate
+    elsif stripe_transaction_id.present?
+      processor_charge = ChargeProcessor.get_charge(charge_processor_id, stripe_transaction_id, merchant_account:)
+      source_payment_method_id = processor_charge.card_instance_id
+      processor_charge.card_mandate
+    elsif processor_payment_intent_id.present? || charge&.stripe_payment_intent_id.present?
+      payment_intent_id = processor_payment_intent_id || charge.stripe_payment_intent_id
+      charge_intent = ChargeProcessor.get_charge_intent(merchant_account, payment_intent_id)
+      raise "Indian card mandate check found an incomplete PaymentIntent" unless charge_intent&.succeeded?
+
+      source_payment_method_id = charge_intent.payment_method_id
+      charge_intent.charge.card_mandate
+    end
+
+    mandate = ChargeProcessor.get_mandate(merchant_account, mandate_id) if mandate_id.present?
+    status = mandate&.status || "missing"
+    raise "Unknown Stripe mandate status: #{status}" unless status.in?(%w[active inactive pending missing])
+
+    payment_method_id = credit_card.processor_payment_method_id.presence || source_payment_method_id
+    unless StripeChargeProcessor.mandate_matches_payment_method?(mandate, payment_method_id)
+      ErrorNotifier.notify(
+        "Indian card mandate does not match the purchase payment method",
+        purchase: external_id
+      ) if mandate.present?
+      return [nil, "missing"]
+    end
+
+    [mandate, status]
+  end
+
+  def record_indian_card_mandate_status!(status, mandate_id: nil)
+    previous_status = indian_card_mandate_status
+    with_lock do
+      self.indian_card_mandate_missing = status == "missing"
+      self.indian_card_mandate_inactive = status == "inactive"
+      self.indian_card_mandate_pending = status == "pending"
+      save!
+    end
+    stored_mandate_id = mandate_id if credit_card&.processor_payment_method_id.present?
+    subscription&.update_renewal_for_indian_card_mandate!(
+      status,
+      expected_credit_card_id: credit_card_id,
+      expected_registration_purchase_id: id,
+      mandate_id: stored_mandate_id,
+      clear_reauthorization: status == "active" && indian_card_charge_intent_matches_subscription_terms?,
+      notify_buyer: status.in?(%w[inactive missing]),
+      notify_buyer_if_already_disabled: previous_status == "pending" && status.in?(%w[inactive missing])
+    )
+    return if status == "active" || status == previous_status
+
+    ErrorNotifier.notify(
+      "Indian card recurring purchase completed without an active e-mandate",
+      purchase: external_id,
+      mandate_status: status
+    )
+  end
+
+  def indian_card_charge_intent_matches_subscription_terms?
+    return false unless subscription&.indian_card_mandate_requires_reauthorization?
+    return false if processor_payment_intent_id.blank?
+
+    intent = ChargeProcessor.get_charge_intent(merchant_account, processor_payment_intent_id)
+    return false unless intent&.succeeded?
+
+    card = credit_card
+    expected_terms = subscription.indian_card_mandate_terms
+    mandate_options = intent.card_mandate_options
+    return false if card.nil? || expected_terms.blank? || mandate_options.blank?
+
+    intent.payment_method_id == card.processor_payment_method_id &&
+      intent.customer_id == card.stripe_customer_id &&
+      intent.setup_future_usage == "off_session" &&
+      intent.currency.to_s.downcase == expected_terms[:currency] &&
+      mandate_options.amount.to_i == expected_terms[:amount] &&
+      mandate_options.amount_type == "maximum" &&
+      mandate_options.interval == expected_terms[:interval] &&
+      mandate_options.interval_count&.to_i == expected_terms[:interval_count]&.to_i &&
+      Array(mandate_options.supported_types).include?("india")
+  end
+
+  def indian_card_mandate_status
+    return "missing" if indian_card_mandate_missing?
+    return "inactive" if indian_card_mandate_inactive?
+    return "pending" if indian_card_mandate_pending?
+    "active" if is_indian_card_mandate_registration?
+  end
+
+  def india_card_mandate_reliability_enabled?
+    Feature.active?(StripeChargeProcessor::INDIA_CARD_MANDATE_RELIABILITY_FEATURE, seller) &&
+      !is_multi_buy? &&
+      !order&.purchases&.many? &&
+      !StripeIntentChargeRouting.direct_charge_account?(merchant_account)
   end
 
   # Same idea as check_indian_card_mandate_was_registered, but for purchases whose recurring
@@ -3827,28 +4036,11 @@ class Purchase < ApplicationRecord
     # Ref: Stripe::SetupIntentsController#create
     return if is_multi_buy?
 
-    interval = "sporadic"
-    interval_count = 1
-
-    if is_original_subscription_purchase? || is_upgrade_purchase?
-      case subscription_duration
-      when "every_two_years"
-        interval = "year"
-        interval_count = 2
-      when "yearly"
-        interval = "year"
-        interval_count = 1
-      when "monthly"
-        interval = "month"
-        interval_count = 1
-      when "quarterly"
-        interval = "month"
-        interval_count = 3
-      when "biannually"
-        interval = "month"
-        interval_count = 6
-      end
-    end
+    # Reauth / card-update purchases enter this method via setup_future_charges, not
+    # the original/upgrade flags. Passing nil recurrence here registers a sporadic
+    # mandate, which RBI issuers then refuse for the same monthly membership.
+    recurrence = subscription_duration if is_original_subscription_purchase? || is_upgrade_purchase? || setup_future_charges
+    interval, interval_count = StripeChargeProcessor.indian_card_mandate_interval(recurrence)
 
     mandate_options = {
       payment_method_options: {
@@ -3861,7 +4053,7 @@ class Purchase < ApplicationRecord
             interval:,
             interval_count:,
             supported_types: ["india"]
-          }
+          }.compact
         }
       }
     }
@@ -3878,7 +4070,49 @@ class Purchase < ApplicationRecord
   # re-authenticate manually. Size the cap to the largest charge this subscription can
   # legitimately make: the undiscounted equivalent of today's total when the discount is
   # temporary, today's total otherwise.
-  def mandate_maximum_amount_cents
+  def mandate_maximum_displayed_price_cents
+    reference_purchase = is_upgrade_purchase? ? subscription.original_purchase : self
+    displayed_price_cents = reference_purchase.displayed_price_cents.to_i
+    discount = reference_purchase.purchase_offer_code_discount
+    return displayed_price_cents if discount.blank? || discount.duration_in_billing_cycles.blank?
+
+    pre_discount_cents = discount.pre_discount_displayed_price_cents ||
+      discount.pre_discount_minimum_price_cents * reference_purchase.quantity
+    [pre_discount_cents, displayed_price_cents].max
+  end
+
+  def indian_card_mandate_price_cents(renewal_price_cents, fixed_rate: nil)
+    displayed_price_cents = mandate_maximum_displayed_price_cents
+    displayed_price_cents = renewal_price_cents if displayed_price_cents.zero?
+    displayed_currency = self[:displayed_price_currency_type].presence || link.price_currency_type
+    get_usd_cents(displayed_currency, displayed_price_cents, rate: fixed_rate)
+  end
+
+  def indian_card_mandate_amount_for_billing_info(billing_info, price_cents, buyer_vat_id: business_vat_id)
+    info = billing_info.to_h.symbolize_keys
+    country = Compliance::Countries.find_by_name(info[:country])&.alpha2 || info[:country]
+    return 0 unless price_cents.positive?
+
+    tax = SalesTaxCalculator.new(
+      product: link,
+      price_cents:,
+      shipping_cents: shipping_cents.to_i,
+      quantity:,
+      buyer_location: {
+        postal_code: info[:zip_code] || info[:postal_code],
+        country:,
+        state: info[:state],
+        ip_address:,
+      },
+      buyer_vat_id:,
+      from_discover: was_discover_fee_charged?
+    ).calculate
+    price_cents + shipping_cents.to_i + tax.tax_cents.to_i
+  end
+
+  # `fixed_rate` pins the displayed-to-USD conversion the free-trial branch needs, so a
+  # cached-rate refresh between sizing a mandate and validating it compares equal amounts.
+  def mandate_maximum_amount_cents(fixed_rate: nil)
     # An upgrade purchase only charges the prorated difference today, and any active
     # discount record lives on the subscription's original purchase rather than on the
     # upgrade purchase itself. Future renewals bill that original purchase (which
@@ -3890,6 +4124,29 @@ class Purchase < ApplicationRecord
     # purchase (undersizing the cap so renewals fail).
     reference_purchase = is_upgrade_purchase? ? subscription.original_purchase : self
     base_cents = reference_purchase.total_transaction_cents
+    if reference_purchase.is_free_trial_purchase?
+      renewal_price_cents = if reference_purchase.subscription.present?
+        reference_purchase.subscription.current_subscription_price_cents
+      else
+        reference_purchase.mandate_maximum_displayed_price_cents
+      end
+      price_cents = if reference_purchase.subscription.present?
+        reference_purchase.subscription.indian_card_mandate_price_cents(
+          reference_purchase,
+          renewal_price_cents,
+          fixed_rate:
+        )
+      else
+        reference_purchase.indian_card_mandate_price_cents(
+          renewal_price_cents,
+          fixed_rate: reference_purchase.rate_converted_to_usd.presence
+        )
+      end
+      base_cents = reference_purchase.indian_card_mandate_amount_for_billing_info(
+        reference_purchase.slice(:country, :state, :zip_code),
+        price_cents
+      )
+    end
     discount = reference_purchase.purchase_offer_code_discount
     return base_cents if discount.blank? || discount.duration_in_billing_cycles.blank?
     return base_cents unless reference_purchase.displayed_price_cents.to_i.positive?
@@ -3907,6 +4164,11 @@ class Purchase < ApplicationRecord
   end
 
   def build_flow_of_funds_from_combined_charge(combined_flow_of_funds)
+    # Nothing to split until the processor has produced settlement data. Returning nil keeps a
+    # missing flow readable as "not settled yet" (Purchase::SyncStatusWithChargeProcessorService
+    # and #pending_buyer_presentment_settlement? both read it that way) instead of raising mid-split.
+    return if combined_flow_of_funds.nil?
+
     charge_purchases = charge.purchases.to_a.sort_by(&:id)
     purchase_index = charge_purchases.index { |purchase| purchase.id == id }
     raise ArgumentError, "Purchase #{id} is not part of charge #{charge&.id}" if purchase_index.nil?
@@ -4007,6 +4269,15 @@ class Purchase < ApplicationRecord
   def enqueue_record_order_charge_outcome
     order_id = order_purchase&.order_id
     RecordOrderChargeOutcomeJob.perform_async(order_id) if order_id.present?
+  end
+
+  def schedule_indian_card_mandate_registration_check
+    return unless is_indian_card_mandate_registration?
+    return unless india_card_mandate_reliability_enabled?
+
+    after_commit do
+      CheckIndianCardMandateRegistrationJob.perform_async(id)
+    end
   end
 
   def check_for_blocked_customer_emails
@@ -4280,8 +4551,8 @@ class Purchase < ApplicationRecord
       link.save!
     end
 
-    def process_without_charging!(reservable_offer_code: nil)
-      set_price_and_rate
+    def process_without_charging!(reservable_offer_code: nil, locked_rate: nil)
+      set_price_and_rate(locked_rate:)
       calculate_fees
       if reservable_offer_code
         # Serialize the final availability check with the reservation write.
@@ -4296,7 +4567,7 @@ class Purchase < ApplicationRecord
 
       create_sales_tax_info!
 
-      calculate_shipping
+      calculate_shipping(locked_rate:)
       save
 
       if free_purchase?
@@ -4353,18 +4624,41 @@ class Purchase < ApplicationRecord
     end
 
     def load_flow_of_funds(processor_charge)
-      # Synthesising a US dollar flow of funds from the canonical total would be wrong for a
-      # buyer-currency (presentment) charge, where the money actually moved in the buyer's
-      # currency. It is safe here because the guard restricts it to non-Stripe processors, and
-      # only Stripe charges can be presentment charges today. If another processor ever gains
-      # buyer-currency support, this line has to build the flow of funds from that processor's
-      # own amounts instead of assuming dollars.
-      processor_charge.flow_of_funds ||= FlowOfFunds.build_simple_flow_of_funds(Currency::USD, self.total_transaction_cents) if StripeChargeProcessor.charge_processor_id != charge_processor_id
+      # Nil means two different things: on Gumroad-held money the canonical USD total is all
+      # there is to record, but on seller-held money Stripe settlement data simply has not
+      # arrived yet (StripeCharge#build_flow_of_funds), and dollars there become the holding
+      # amount of an account denominated in its own currency — a balance no payout picks up
+      # (gumroad-private#1471). Presentment stays nil for the same reason.
+      unknown_stripe_ownership = stripe_charge_processor? && settlement_merchant_account.nil?
+      if funds_held_by_gumroad? && !buyer_presentment? && !charge&.charge_presentment.present? && !unknown_stripe_ownership
+        # Sized to the whole charge, because the combined-charge split below divides by it.
+        # Stripe with a missing merchant_account is unknown ownership, not Gumroad-held USD.
+        flow_amount_cents = is_part_of_combined_charge? ? charge.amount_cents : total_transaction_cents
+        processor_charge.flow_of_funds ||= FlowOfFunds.build_simple_flow_of_funds(Currency::USD, flow_amount_cents)
+      end
+
       self.flow_of_funds = if is_part_of_combined_charge?
         build_flow_of_funds_from_combined_charge(processor_charge.flow_of_funds)
       else
         processor_charge.flow_of_funds
       end
+    end
+
+    # Only Stripe routes charges into seller-owned accounts (destination and direct), so every
+    # other processor is Gumroad-held. Not charged_using_gumroad_merchant_account?, which is also
+    # true of a seller's own custom account, nor MerchantAccount#holder_of_funds, which answers
+    # the same question by dispatching through the charge-processor registry.
+    # Prefer the Charge's account when a Charge exists: that is where the money actually sat.
+    def funds_held_by_gumroad?
+      !(stripe_charge_processor? && settlement_merchant_account&.user_id.present?)
+    end
+
+    # Charge.merchant_account wins when the Charge row exists, even if that account is nil.
+    # Falling back to Purchase.merchant_account only when there is no Charge keeps a leftover
+    # Gumroad account from minting USD on a seller-held charge, and a nil purchase account
+    # from suppressing the USD fallback on a known Gumroad-held charge.
+    def settlement_merchant_account
+      charge.present? ? charge.merchant_account : merchant_account
     end
 
     def additional_fields_for_creator_app_api
@@ -4516,8 +4810,10 @@ class Purchase < ApplicationRecord
 
     def create_setup_intent(chargeable)
       with_charge_processor_error_handler do
+        mandate_options = mandate_options_for_stripe(with_currency: true)
+        mark_indian_card_mandate_registration! if mandate_options.present?
         self.setup_intent = ChargeProcessor.setup_future_charges!(self.merchant_account, chargeable,
-                                                                  mandate_options: mandate_options_for_stripe(with_currency: true))
+                                                                  mandate_options:)
         return unless setup_intent.present?
 
         self.processor_setup_intent_id = setup_intent.id
@@ -4536,6 +4832,17 @@ class Purchase < ApplicationRecord
       return {} unless off_session
 
       upi_autopay = credit_card&.recurring_upi?
+      indian_card_mandate_currency = if !upi_autopay && subscription&.india_card_mandate_reliability_enabled? &&
+                                        credit_card&.requires_mandate?
+        subscription.indian_card_mandate_terms&.dig(:currency)
+      end
+      return {} if indian_card_mandate_currency == Currency::USD
+
+      required_currency = if upi_autopay
+        Currency::INR
+      elsif indian_card_mandate_currency.present?
+        indian_card_mandate_currency
+      end
       if upi_autopay
         if Feature.inactive?(Checkout::PaymentMethodResolver::UPI_RECURRING_SERVICING_FEATURE)
           defer_upi_recurring_renewal!("servicing flag inactive")
@@ -4546,15 +4853,24 @@ class Purchase < ApplicationRecord
       else
         return {} unless charge_processor_id == StripeChargeProcessor.charge_processor_id
         return {} unless merchant_account&.stripe_charge_processor?
-        return {} unless Checkout::BuyerCurrencyEligibility.seller_enabled?(seller)
+        return {} unless required_currency.present? || Checkout::BuyerCurrencyEligibility.seller_enabled?(seller)
       end
 
+      required_currency_errors = if required_currency.present? && !upi_autopay
+        {
+          required_currency_error_code: PurchaseErrorCode::INDIA_CARD_MANDATE_MISSING,
+          required_currency_error_message: "Your card's recurring payment authorization is not active. Please update your payment method to continue."
+        }
+      else
+        {}
+      end
       result = Purchase::LaterChargePresentmentService.new(
         merchant_account:,
         purchases: [self],
         amount_cents: total_transaction_cents,
         gumroad_amount_cents: total_transaction_amount_for_gumroad_cents,
-        required_currency: (Currency::INR if upi_autopay)
+        required_currency:,
+        **required_currency_errors
       ).perform
       return {} if result.blank?
 
@@ -4598,9 +4914,48 @@ class Purchase < ApplicationRecord
       presentment_cap_cents = [presentment_cap_cents, presentment_args[:processor_amount_cents].to_i].max
 
       inner = mandate_options[:payment_method_options][:card][:mandate_options]
-                .merge(amount: presentment_cap_cents, currency: presentment_currency)
+                .merge(amount: presentment_cap_cents)
+      unless india_card_mandate_reliability_enabled?
+        inner = inner.merge(currency: presentment_currency)
+      end
       mandate_options.deep_merge(
         payment_method_options: { card: { mandate_options: inner } }
+      )
+    end
+
+    def validate_indian_card_mandate_for_rebill!(chargeable)
+      return unless stripe_charge_processor?
+      return if subscription.blank?
+      return unless india_card_mandate_reliability_enabled?
+      return unless credit_card&.requires_mandate?
+
+      mandate, status, source = subscription&.indian_card_mandate_for(credit_card_id) || [nil, "missing", nil]
+      source&.record_indian_card_mandate_status!(status, mandate_id: mandate&.id)
+
+      if status == "active"
+        stripe_chargeable = chargeable.get_chargeable_for(StripeChargeProcessor.charge_processor_id)
+        stripe_chargeable.validated_stripe_mandate_id = mandate.id
+        return
+      end
+
+      if status == "pending" && source.present?
+        source.mark_indian_card_mandate_registration!
+        CheckIndianCardMandateRegistrationJob.perform_async(source.id)
+      end
+      ErrorNotifier.notify(
+        "Off-session charge on an Indian card has no active e-mandate to reference",
+        reference: external_id,
+        mandate_status: status,
+        fail_fast: true
+      )
+      error_code = {
+        "missing" => PurchaseErrorCode::INDIA_CARD_MANDATE_MISSING,
+        "inactive" => PurchaseErrorCode::INDIA_CARD_MANDATE_INACTIVE,
+        "pending" => PurchaseErrorCode::INDIA_CARD_MANDATE_PENDING,
+      }.fetch(status)
+      raise ChargeProcessorCardError.new(
+        error_code,
+        "Your card's recurring payment authorization is not active. Please update your payment method to continue."
       )
     end
 
@@ -4610,12 +4965,14 @@ class Purchase < ApplicationRecord
         amount_for_gumroad_cents = total_transaction_amount_for_gumroad_cents
         description = "You bought #{link.long_url}!"
         mandate_options = mandate_options_for_stripe
+        mark_indian_card_mandate_registration! if mandate_options.present?
 
         # Renewals and preorder releases rebill a saved card whose e-mandate (Indian cards)
         # was registered at the original purchase, so a missing mandate on those charges is
         # an anomaly worth reporting/failing on. First-time checkout charges can also run
         # off-session (multi-seller carts) but must not be treated that way.
         mandate_expected = is_a_saved_card_rebill?
+        validate_indian_card_mandate_for_rebill!(chargeable) if mandate_expected
 
         # Delayed product charges reuse the buyer-currency price fixed at checkout.
         #
@@ -4944,7 +5301,12 @@ class Purchase < ApplicationRecord
     end
 
     def gumroad_flat_fee_per_thousand
-      seller.waive_gumroad_fee_on_new_sales? && subscription.blank? && !is_preorder_charge? ? 0 : GUMROAD_FLAT_FEE_PER_THOUSAND
+      return 0 if seller.waive_gumroad_fee_on_new_sales? && subscription.blank? && !is_preorder_charge?
+      # Discover keeps its full 30%: the 5% volume rate applies to direct sales only,
+      # so don't let it lower the base under the discover surcharge.
+      return User::HIGH_VOLUME_FEE_PER_THOUSAND if seller.high_volume_seller_fee? && !charge_discover_fee?
+
+      GUMROAD_FLAT_FEE_PER_THOUSAND
     end
 
     def calculate_taxes
@@ -5016,7 +5378,7 @@ class Purchase < ApplicationRecord
       self.was_tax_excluded_from_price = true
     end
 
-    def calculate_shipping
+    def calculate_shipping(locked_rate: nil)
       return unless link.is_physical
       return if country.blank?
 
@@ -5026,7 +5388,7 @@ class Purchase < ApplicationRecord
         preorder.authorization_purchase.shipping_cents
       else
         shipping_rate = ShippingDestination.for_product_and_country_code(product: link, country_code: Compliance::Countries.find_by_name(country)&.alpha2)
-        shipping_rate.calculate_shipping_rate(quantity:, currency_type: link.price_currency_type)
+        shipping_rate.calculate_shipping_rate(quantity:, currency_type: link.price_currency_type, rate: locked_rate)
       end
     end
 
@@ -5329,7 +5691,13 @@ class Purchase < ApplicationRecord
         "in_progress"
       ]
 
-      last_allowed_purchase_at = if is_upgrade_purchase? || link.quantity_enabled || link.is_physical || link.is_licensed
+      # Physical first except upgrades: a physical membership upgrade is a
+      # same-link charge the updater fires on purpose, not an accidental retry.
+      last_allowed_purchase_at = if is_upgrade_purchase?
+        10.seconds.ago
+      elsif link.is_physical
+        2.hours.ago
+      elsif link.quantity_enabled || link.is_licensed
         10.seconds.ago
       else
         3.minutes.ago
@@ -5400,7 +5768,7 @@ class Purchase < ApplicationRecord
       settling = settling.not_is_gift_sender_purchase unless is_gift_sender_purchase
 
       # Gift purchases are stored under the sender's email, so they only turn up via the gift
-      # record. The time-boxed check above deliberately ignores gifts older than a few minutes,
+      # record. The time-boxed check above ignores gifts older than the product-specific window,
       # which means an unresolved gift paid by bank debit would otherwise be invisible here — so
       # look it up explicitly, with no window, exactly like the non-gift settling lookup.
       #

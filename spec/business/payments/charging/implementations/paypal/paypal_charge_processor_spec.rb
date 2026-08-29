@@ -1356,14 +1356,16 @@ describe PaypalChargeProcessor, :vcr do
 
     context "when paypal order id is present in chargeable" do
       it "charges already approved order without creating a new order and returns PaypalCharge" do
-        purchase = create(:purchase, paypal_order_id: "5AF67588T4374172W")
+        purchase = create(:purchase, paypal_order_id: "5AF67588T4374172W", price_cents: 10_00)
         chargeable = PaypalApprovedOrderChargeable.new(purchase.paypal_order_id, "paypal-gr-integspecs@gumroad.com",
                                                        "US")
 
         expect_any_instance_of(PaypalChargeProcessor).not_to receive(:create_order)
         expect_any_instance_of(PaypalChargeProcessor).to receive(:update_invoice_id).and_call_original
         expect_any_instance_of(PaypalChargeProcessor).to receive(:capture_order)
-                                                           .with(order_id: purchase.paypal_order_id).and_call_original
+                                                           .with(order_id: purchase.paypal_order_id,
+                                                                 expected_purchase_unit_info: hash_including(currency: "usd"))
+                                                           .and_call_original
 
         charge = subject.create_payment_intent_or_charge!(create(:merchant_account_paypal, user: purchase.seller),
                                                           chargeable, 0, 0, purchase.external_id, "")
@@ -1403,7 +1405,7 @@ describe PaypalChargeProcessor, :vcr do
 
         it "creates new paypal order and charges it and returns PaypalChargeIntent" do
           expect(PaypalChargeProcessor).to receive(:paypal_order_info_from_charge).and_call_original
-          expect(PaypalChargeProcessor).to receive(:create_order_from_charge).and_call_original
+          expect(PaypalChargeProcessor).to receive(:create_order).and_call_original
           expect_any_instance_of(PaypalChargeProcessor).to receive(:capture_order)
                                                              .with(order_id: an_instance_of(String),
                                                                    billing_agreement_id: "B-38D505255T217912K")
@@ -1428,6 +1430,68 @@ describe PaypalChargeProcessor, :vcr do
           end.to raise_error(ChargeProcessorInvalidRequestError)
         end
       end
+    end
+  end
+
+  describe "#capture_order" do
+    def paypal_capture_response(total: "13.50", currency: "USD", status: PaypalApiPaymentStatus::COMPLETED, merchant_id: "MN7CSWD6RCNJ8")
+      capture = OpenStruct.new(
+        id: "79740133TG6557546",
+        status:,
+        amount: OpenStruct.new(currency_code: currency, value: total),
+        status_details: OpenStruct.new(reason: nil)
+      )
+      OpenStruct.new(
+        purchase_units: [OpenStruct.new(
+          payments: OpenStruct.new(captures: [capture]),
+          payee: OpenStruct.new(merchant_id:)
+        )]
+      )
+    end
+
+    let(:expected_purchase_unit_info) { { currency: "usd", total: BigDecimal("13.50") } }
+
+    it "returns a charge intent when the captured amount matches Gumroad's expected order total" do
+      allow(PaypalChargeProcessor).to receive(:capture).and_return(paypal_capture_response(total: "13.50"))
+      allow(PaypalCharge).to receive(:new).and_return(OpenStruct.new(processor_transaction_id: "79740133TG6557546"))
+
+      charge_intent = subject.capture_order(order_id: "80T882348N361143U", expected_purchase_unit_info:)
+
+      expect(charge_intent).to be_a(PaypalChargeIntent)
+      expect(charge_intent.charge.processor_transaction_id).to eq("79740133TG6557546")
+    end
+
+    it "rejects a completed PayPal capture below Gumroad's expected order total" do
+      allow(PaypalChargeProcessor).to receive(:capture).and_return(paypal_capture_response(total: "6.75"))
+
+      expect do
+        subject.capture_order(order_id: "80T882348N361143U", expected_purchase_unit_info:)
+      end.to raise_error(ChargeProcessorError, /captured amount does not match/)
+    end
+
+    it "refunds a mismatched capture instead of leaving the underpayment settled" do
+      merchant_account = create(:merchant_account_paypal, charge_processor_merchant_id: "MN7CSWD6RCNJ8")
+      allow(PaypalChargeProcessor).to receive(:capture).and_return(paypal_capture_response(total: "6.75"))
+      expect(subject).to receive(:refund!).with(
+        "79740133TG6557546",
+        merchant_account:,
+        paypal_order_purchase_unit_refund: true
+      )
+
+      expect do
+        subject.capture_order(order_id: "80T882348N361143U", expected_purchase_unit_info:)
+      end.to raise_error(ChargeProcessorError, /captured amount does not match/)
+    end
+
+    it "still raises the amount-mismatch error even if reversing the capture fails" do
+      create(:merchant_account_paypal, charge_processor_merchant_id: "MN7CSWD6RCNJ8")
+      allow(PaypalChargeProcessor).to receive(:capture).and_return(paypal_capture_response(total: "6.75"))
+      allow(subject).to receive(:refund!).and_raise(ChargeProcessorInvalidRequestError, "boom")
+      expect(ErrorNotifier).to receive(:notify).with(instance_of(ChargeProcessorInvalidRequestError), hash_including(reason: "mismatched_capture_refund_failed"))
+
+      expect do
+        subject.capture_order(order_id: "80T882348N361143U", expected_purchase_unit_info:)
+      end.to raise_error(ChargeProcessorError, /captured amount does not match/)
     end
   end
 
@@ -2302,312 +2366,29 @@ describe PaypalChargeProcessor, :vcr do
     end
   end
 
-  describe ".create_order_from_product_info" do
-    it "creates a new paypal order with the given product info" do
-      creator = create(:user)
-      product = create(:product, user: creator)
-      paypal_merchant_account = create(:merchant_account_paypal, charge_processor_merchant_id: "CJS32DZ7NDN5L",
-                                                                 user: creator, country: "GB", currency: "gbp")
-
-      purchase_unit_info = {
-        external_id: product.external_id,
-        currency_code: paypal_merchant_account.currency,
-        price_cents: 10_00,
-        shipping_cents: 1_50,
-        tax_cents: 2_00,
-        exclusive_tax_cents: 2_00,
-        total_cents: 13_50,
-        quantity: 2,
-      }
-
-      paypal_order_id = PaypalChargeProcessor.create_order_from_product_info(purchase_unit_info)
-      expect(paypal_order_id).to be_present
-    end
-
-    it "creates a new paypal order if product currency is usd but merchant account currency is not" do
-      creator = create(:user)
-      product_name = "🚧 MDE.TV High-Roller Paywall 🚧 (INCLUDES ALL NEW 🍖 VIDEO CONTENT & NICK ROCHEFORT) " \
-                     "and you also get......... 💥 THE GREAT WAR!!! 💥 Your Favourite!!!"
-      product = create(:product, user: creator, name: product_name)
-      paypal_merchant_account = create(:merchant_account_paypal, charge_processor_merchant_id: "CJS32DZ7NDN5L",
-                                                                 user: creator, country: "GB", currency: "gbp")
-
-      purchase_unit_info = {
-        external_id: product.external_id,
-        currency_code: "usd",
-        price_cents: 15_00,
-        shipping_cents: 1_50,
-        tax_cents: 2_00,
-        exclusive_tax_cents: 2_00,
-        total_cents: 18_50,
-        quantity: 2,
-      }
-
-      expected_args = { permalink: product.unique_permalink,
-                        item_name: product_name.gsub(
-                          /[^A-Z0-9. ]/i, "").to_s.strip[0...PaypalChargeProcessor::MAXIMUM_ITEM_NAME_LENGTH],
-                        currency: "gbp",
-                        merchant_id: paypal_merchant_account.charge_processor_merchant_id,
-                        descriptor: product.statement_description.gsub(/[^A-Z0-9. ]/i, "").to_s,
-                        price_cents_usd: 15_00,
-                        shipping_cents_usd: 1_50,
-                        tax_cents_usd: 2_00,
-                        fee_cents_usd: 150,
-                        total_cents_usd: 18_50,
-                        quantity: 2 }
-
-      expect(PaypalChargeProcessor).to receive(:create_purchase_unit_info).with(**expected_args).and_call_original
-      paypal_order_id = PaypalChargeProcessor.create_order_from_product_info(purchase_unit_info)
-      expect(paypal_order_id).to be_present
-    end
-
-    it "creates a new paypal order if merchant account currency is usd but product currency is not" do
-      creator = create(:user)
-      product = create(:product, user: creator, price_currency_type: "aud")
-      paypal_merchant_account = create(:merchant_account_paypal, charge_processor_merchant_id: "B66YJBBNCRW6L",
-                                                                 user: creator, country: "US", currency: "usd")
-
-      purchase_unit_info = {
-        external_id: product.external_id,
-        currency_code: "aud",
-        price_cents: 15_00,
-        shipping_cents: 1_50,
-        tax_cents: 2_00,
-        exclusive_tax_cents: 2_00,
-        total_cents: 18_50,
-        quantity: 2,
-      }
-
-      expected_args = { permalink: product.unique_permalink,
-                        item_name: product.name,
-                        currency: "usd",
-                        merchant_id: paypal_merchant_account.charge_processor_merchant_id,
-                        descriptor: product.statement_description.gsub(/[^A-Z0-9. ]/i, "").to_s,
-                        price_cents_usd: 15_47,
-                        shipping_cents_usd: 1_55,
-                        tax_cents_usd: 2_06,
-                        fee_cents_usd: 154,
-                        total_cents_usd: 19_08,
-                        quantity: 2 }
-
-      expect(PaypalChargeProcessor).to receive(:create_purchase_unit_info).with(**expected_args).and_call_original
-      paypal_order_id = PaypalChargeProcessor.create_order_from_product_info(purchase_unit_info)
-      expect(paypal_order_id).to be_present
-    end
-
-    it "creates a new paypal order if merchant account currency and product currency are different and none is usd" do
-      creator = create(:user)
-      product = create(:product, user: creator, price_currency_type: "aud")
-      paypal_merchant_account = create(:merchant_account_paypal, charge_processor_merchant_id: "CJS32DZ7NDN5L",
-                                                                 user: creator, country: "GB", currency: "gbp")
-
-      purchase_unit_info = {
-        external_id: product.external_id,
-        currency_code: "aud",
-        price_cents: 15_00,
-        shipping_cents: 1_50,
-        tax_cents: 2_00,
-        exclusive_tax_cents: 2_00,
-        total_cents: 18_50,
-        quantity: 2,
-      }
-
-      expected_args = { permalink: product.unique_permalink,
-                        item_name: product.name,
-                        currency: "gbp",
-                        merchant_id: paypal_merchant_account.charge_processor_merchant_id,
-                        descriptor: product.statement_description.gsub(/[^A-Z0-9. ]/i, "").to_s,
-                        price_cents_usd: 15_47,
-                        shipping_cents_usd: 1_55,
-                        tax_cents_usd: 2_06,
-                        fee_cents_usd: 154,
-                        total_cents_usd: 19_08,
-                        quantity: 2 }
-
-      expect(PaypalChargeProcessor).to receive(:create_purchase_unit_info).with(**expected_args).and_call_original
-      paypal_order_id = PaypalChargeProcessor.create_order_from_product_info(purchase_unit_info)
-      expect(paypal_order_id).to be_present
-    end
-
-
-    it "creates a new paypal order with item name as product's custom_permalink if product's name becomes empty on " \
-       "sanitization" do
-      creator = create(:user)
-      product = create(:product, user: creator, price_currency_type: "aud", name: "🚧 🚧 🍖 💥 💥",
-                                 custom_permalink: "custom")
-      paypal_merchant_account = create(:merchant_account_paypal, charge_processor_merchant_id: "CJS32DZ7NDN5L",
-                                                                 user: creator, country: "GB", currency: "gbp")
-
-      purchase_unit_info = {
-        external_id: product.external_id,
-        currency_code: "aud",
-        price_cents: 15_00,
-        shipping_cents: 1_50,
-        tax_cents: 2_00,
-        exclusive_tax_cents: 2_00,
-        total_cents: 18_50,
-        quantity: 2,
-      }
-
-      expected_args = { permalink: product.unique_permalink,
-                        item_name: "custom",
-                        currency: "gbp",
-                        merchant_id: paypal_merchant_account.charge_processor_merchant_id,
-                        descriptor: product.statement_description.gsub(/[^A-Z0-9. ]/i, "").to_s,
-                        price_cents_usd: 15_47,
-                        shipping_cents_usd: 1_55,
-                        tax_cents_usd: 2_06,
-                        fee_cents_usd: 154,
-                        total_cents_usd: 19_08,
-                        quantity: 2 }
-
-      expect(PaypalChargeProcessor).to receive(:create_purchase_unit_info).with(**expected_args).and_call_original
-
-      paypal_order_id = PaypalChargeProcessor.create_order_from_product_info(purchase_unit_info)
-      expect(paypal_order_id).to be_present
-    end
-
-    it "creates a new paypal order with item name as product's unique_permalink if the product's name becomes empty " \
-       "on sanitization and there's no custom_permalink" do
-      creator = create(:user)
-      product = create(:product, user: creator, price_currency_type: "aud", name: "🚧 🚧 🍖 💥 💥")
-      paypal_merchant_account = create(:merchant_account_paypal, charge_processor_merchant_id: "CJS32DZ7NDN5L",
-                                                                 user: creator, country: "GB", currency: "gbp")
-
-      purchase_unit_info = {
-        external_id: product.external_id,
-        currency_code: "aud",
-        price_cents: 15_00,
-        shipping_cents: 1_50,
-        tax_cents: 2_00,
-        exclusive_tax_cents: 2_00,
-        total_cents: 18_50,
-        quantity: 2,
-      }
-
-      expect(PaypalChargeProcessor).to receive(:create_purchase_unit_info).with(
-        { permalink: product.unique_permalink,
-          item_name: product.unique_permalink,
-          currency: "gbp",
-          merchant_id: paypal_merchant_account.charge_processor_merchant_id,
-          descriptor: product.statement_description.gsub(
-            /[^A-Z0-9. ]/i, "").to_s,
-          price_cents_usd: 15_47,
-          shipping_cents_usd: 1_55,
-          tax_cents_usd: 2_06,
-          fee_cents_usd: 154,
-          total_cents_usd: 19_08,
-          quantity: 2 }).and_call_original
-
-      paypal_order_id = PaypalChargeProcessor.create_order_from_product_info(purchase_unit_info)
-      expect(paypal_order_id).to be_present
-    end
-  end
-
-  describe ".update_order_from_product_info" do
-    it "updates the paypal order with the given product info and returns true" do
-      creator = create(:user)
-      product = create(:product, user: creator)
-      paypal_merchant_account = create(:merchant_account_paypal, charge_processor_merchant_id: "MN7CSWD6RCNJ8",
-                                                                 user: creator, country: "US", currency: "usd")
-
-      purchase_unit_info = {
-        external_id: product.external_id,
-        currency_code: paypal_merchant_account.currency,
-        price_cents: 10_00,
-        shipping_cents: 1_50,
-        tax_cents: 2_00,
-        exclusive_tax_cents: 2_00,
-        total_cents: 13_50,
-        quantity: 2,
-      }
-
-      paypal_order_id = PaypalChargeProcessor.create_order_from_product_info(purchase_unit_info)
-      expect(paypal_order_id).to be_present
-
-      order_details = PaypalChargeProcessor.fetch_order(order_id: paypal_order_id)
-      purchase_unit = order_details["purchase_units"][0]
-      expect(purchase_unit["amount"]["value"]).to eq("13.50")
-      expect(purchase_unit["amount"]["breakdown"]["item_total"]["value"]).to eq("10.00")
-      expect(purchase_unit["amount"]["breakdown"]["shipping"]["value"]).to eq("1.50")
-      expect(purchase_unit["amount"]["breakdown"]["tax_total"]["value"]).to eq("2.00")
-      expect(purchase_unit["payee"]["merchant_id"]).to eq("MN7CSWD6RCNJ8")
-      expect(purchase_unit["items"][0]["quantity"]).to eq("2")
-      expect(purchase_unit["items"][0]["unit_amount"]["value"]).to eq("5.00")
-      expect(purchase_unit["payment_instruction"]["platform_fees"].size).to eq(1)
-      expect(purchase_unit["payment_instruction"]["platform_fees"][0]["amount"]["value"]).to eq("0.70")
-
-      updated_purchase_unit_info = {
-        external_id: product.external_id,
-        currency_code: paypal_merchant_account.currency,
-        price_cents: 5_00,
-        shipping_cents: 75,
-        tax_cents: 1_00,
-        exclusive_tax_cents: 1_00,
-        total_cents: 6_75,
-        quantity: 2,
-      }
-
-      expect(PaypalChargeProcessor).to receive(:update_order).and_call_original
-      success = PaypalChargeProcessor.update_order_from_product_info(paypal_order_id, updated_purchase_unit_info)
-      expect(success).to be (true)
-
-      order_details = PaypalChargeProcessor.fetch_order(order_id: paypal_order_id)
-      purchase_unit = order_details["purchase_units"][0]
-      expect(purchase_unit["amount"]["value"]).to eq("6.75")
-      expect(purchase_unit["amount"]["breakdown"]["item_total"]["value"]).to eq("5.00")
-      expect(purchase_unit["amount"]["breakdown"]["shipping"]["value"]).to eq("0.75")
-      expect(purchase_unit["amount"]["breakdown"]["tax_total"]["value"]).to eq("1.00")
-      expect(purchase_unit["payee"]["email_address"]).to eq("sb-c7jpx2385730@business.example.com")
-      expect(purchase_unit["items"][0]["quantity"]).to eq("2")
-      expect(purchase_unit["items"][0]["unit_amount"]["value"]).to eq("2.50")
-      expect(purchase_unit["payment_instruction"]["platform_fees"].size).to eq(1)
-      expect(purchase_unit["payment_instruction"]["platform_fees"][0]["amount"]["value"]).to eq("0.35")
-    end
-
-    it "raises error if paypal order id is not present" do
-      updated_purchase_unit_info = {
-        external_id: "JrkmJ574Xk5Nqz1Bv9cLOA==",
-        currency_code: "usd",
-        price_cents: 5_00,
-        shipping_cents: 75,
-        tax_cents: 1_00,
-        exclusive_tax_cents: 1_00,
-        total_cents: 6_75,
-        quantity: 2,
-      }
-
-      expect do
-        PaypalChargeProcessor.update_order_from_product_info("", updated_purchase_unit_info)
-      end.to raise_error(ChargeProcessorError)
-    end
-
-    it "raises error if product info is not present" do
-      expect do
-        PaypalChargeProcessor.update_order_from_product_info("27B71908FM8616631", {})
-      end.to raise_error(ChargeProcessorError)
-    end
-  end
-
   describe "#update_invoice_id" do
     it "updates the invoice id for paypal order" do
       creator = create(:user)
-      product = create(:product, user: creator)
+      product = create(:product, user: creator, price_currency_type: "gbp", is_physical: true, require_shipping: true,
+                                 shipping_destinations: [ShippingDestination.new(country_code: "GB", one_item_rate_cents: 1_00, multiple_items_rate_cents: 50)])
       paypal_merchant_account = create(:merchant_account_paypal, charge_processor_merchant_id: "CJS32DZ7NDN5L",
                                                                  user: creator, country: "GB", currency: "gbp")
 
-      purchase_unit_info = {
-        external_id: product.external_id,
-        currency_code: paypal_merchant_account.currency,
-        price_cents: 10_00,
-        shipping_cents: 1_50,
-        tax_cents: 2_00,
-        exclusive_tax_cents: 2_00,
-        total_cents: 13_50,
+      purchase_unit_info = PaypalChargeProcessor.create_purchase_unit_info(
+        permalink: product.unique_permalink,
+        item_name: product.name,
+        currency: paypal_merchant_account.currency,
+        merchant_id: paypal_merchant_account.charge_processor_merchant_id,
+        descriptor: product.statement_description,
+        price_cents_usd: 10_00,
+        shipping_cents_usd: 1_50,
+        tax_cents_usd: 2_00,
+        fee_cents_usd: 1_50,
+        total_cents_usd: 13_50,
         quantity: 2,
-      }
+      )
 
-      paypal_order_id = PaypalChargeProcessor.create_order_from_product_info(purchase_unit_info)
+      paypal_order_id = PaypalChargeProcessor.create_order(purchase_unit_info)
       expect(paypal_order_id).to be_present
 
       paypal_order = PaypalChargeProcessor.fetch_order(order_id: paypal_order_id)

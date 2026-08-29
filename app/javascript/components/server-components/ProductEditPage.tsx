@@ -7,6 +7,7 @@ import typia from "typia";
 import {
   applyRichContentPageSaveResponse,
   canonicalRichContentScope,
+  hasMoveSourceScope,
   HiddenVariantContentConflictError,
   reconcileConfirmedRemovalIds,
   richContentMoveSourceIds,
@@ -14,13 +15,16 @@ import {
   StaleContentConflictError,
   StaleDeletionConflictError,
   saveProduct,
+  scopedRichContentPageKey,
 } from "$app/data/product_edit";
 import { OtherRefundPolicy } from "$app/data/products/other_refund_policies";
 import { Thumbnail } from "$app/data/thumbnails";
 import { RatingsWithPercentages } from "$app/parsers/product";
 import { CurrencyCode } from "$app/utils/currency";
+import { useDedupeInFlight } from "$app/utils/dedupeInFlight";
 import { Taxonomy } from "$app/utils/discover";
 import { ALLOWED_EXTENSIONS } from "$app/utils/file";
+import GuidGenerator from "$app/utils/guid_generator";
 import { assertResponseError, request } from "$app/utils/request";
 
 import { Button } from "$app/components/Button";
@@ -153,7 +157,15 @@ const createContextValue = (props: Props) => ({
   aiGenerated: props.ai_generated,
 });
 
-const pagesHaveSameContent = (pages1: Page[], pages2: Page[]): boolean => isEqual(pages1, pages2);
+// reconciliation_id is save plumbing, not content: the first save stamps
+// pages that the baseline clone predates, and that difference must not read
+// as a content change (it would offer customer notifications for pages the
+// seller never touched).
+const pagesHaveSameContent = (pages1: Page[], pages2: Page[]): boolean =>
+  isEqual(
+    pages1.map(({ reconciliation_id: _, ...page }) => page),
+    pages2.map(({ reconciliation_id: _, ...page }) => page),
+  );
 
 // Client-side mirror of RichContent#has_editor_content?: a page counts as
 // contentful when its tiptap document contains anything a buyer could see.
@@ -191,43 +203,58 @@ type PendingDeletions = {
   pages: { id: string; title: string | null }[];
 };
 
-const findPendingDeletions = (product: Product, lastSavedProduct: Product): PendingDeletions => {
-  // Note: deletions the seller confirmed per-row (the "Yes, remove" /
-  // delete-page modals record ids into confirmed_removed_*_ids) are NOT
-  // excluded here. Those ids exist to satisfy the server-side deletion guard;
-  // this summary modal is deliberately a second, save-time gate — the last
-  // chance to notice an accumulated (possibly large) wipe as one list before
-  // it becomes permanent. Every UI deletion path records a confirmed id, so
-  // excluding them would mean the summary never appears at all.
+// Splits the missing-from-state diff on recorded intent: every UI deletion
+// path writes the removed id into confirmed_removed_*_ids, so a missing id
+// on that list is a seller deletion (summary modal) and one off it is lost
+// browser state (gumroad-private#2023) — the save must stop and offer a
+// reload rather than present the loss as a deletion.
+const findPendingDeletions = (
+  product: Product,
+  lastSavedProduct: Product,
+): { confirmed: PendingDeletions; unexpected: PendingDeletions } => {
   const currentVariantIds = new Set(product.variants.map(({ id }) => id));
-  // Only content-bearing variants warrant the scary confirmation — mirroring
-  // the server-side guard, which protects variants with visible rich-content
-  // pages OR directly-attached files (legacy products predating embedded
-  // rich-content files). Contentless variants (e.g. a coffee product's
-  // "suggested amounts", an empty just-added version) delete without fuss.
+  // Only content-bearing variants warrant the scary confirmation, mirroring
+  // the server-side guard; contentless ones delete without fuss.
   const removedVariants = lastSavedProduct.variants.filter(
     ({ id, rich_content, has_files }) =>
       !currentVariantIds.has(id) && (rich_content.some(pageHasVisibleContent) || has_files === true),
   );
 
-  // A page id that still appears anywhere in the current state (product-level
-  // or under any variant) is a MOVE (e.g. toggling "use the same content for
-  // all versions"), not a deletion.
-  const currentPageIds = new Set([
-    ...product.rich_content.map(({ id }) => id),
-    ...product.variants.flatMap((variant) => variant.rich_content.map(({ id }) => id)),
-  ]);
+  const currentPages = [...product.rich_content, ...product.variants.flatMap((variant) => variant.rich_content)];
+  const currentPageIds = new Set(currentPages.map(({ id }) => id));
+  const currentPageStamps = new Set(
+    currentPages.flatMap((page) => (page.reconciliation_id ? [page.reconciliation_id] : [])),
+  );
+  // A page still present somewhere in current state was moved, not deleted.
+  // Presence is judged by the send-time stamp when the baseline has one: raw
+  // ids can repeat across scopes, so a same-id page in another scope proves
+  // nothing about THIS page. Unstamped baselines (no save this session yet)
+  // hold server-loaded pages with unique ids, so the raw id suffices there.
+  const pageStillPresent = (page: Page) =>
+    page.reconciliation_id ? currentPageStamps.has(page.reconciliation_id) : currentPageIds.has(page.id);
   const removedPagesById = new Map<string, Page>();
   for (const page of [
     ...lastSavedProduct.rich_content,
     ...lastSavedProduct.variants.flatMap((variant) => variant.rich_content),
   ]) {
-    if (!currentPageIds.has(page.id) && pageHasVisibleContent(page)) removedPagesById.set(page.id, page);
+    if (!pageStillPresent(page) && pageHasVisibleContent(page)) removedPagesById.set(page.id, page);
   }
 
+  // Removing a variant records its pages' ids too, so a page-level confirmed
+  // id is the single test for intent.
+  const confirmedVariantIds = new Set(product.confirmed_removed_variant_ids ?? []);
+  const confirmedPageIds = new Set(product.confirmed_removed_rich_content_ids ?? []);
+  const variants = removedVariants.map(({ id, name }) => ({ id, name }));
+  const pages = [...removedPagesById.values()].map(({ id, title }) => ({ id, title }));
   return {
-    variants: removedVariants.map(({ id, name }) => ({ id, name })),
-    pages: [...removedPagesById.values()].map(({ id, title }) => ({ id, title })),
+    confirmed: {
+      variants: variants.filter(({ id }) => confirmedVariantIds.has(id)),
+      pages: pages.filter(({ id }) => confirmedPageIds.has(id)),
+    },
+    unexpected: {
+      variants: variants.filter(({ id }) => !confirmedVariantIds.has(id)),
+      pages: pages.filter(({ id }) => !confirmedPageIds.has(id)),
+    },
   };
 };
 
@@ -238,6 +265,9 @@ const findPendingDeletions = (product: Product, lastSavedProduct: Product): Pend
 // server's Product::RichContentDeletionGuard).
 type ScopedPage = { page: Page; scope: string | null };
 
+// A page's client-generated id is only unique WITHIN a scope, not across the
+// whole payload (gumroad-private#2023). Key the lookup on scope+id so pages
+// sharing a raw id in different scopes don't clobber each other in the Map.
 const allScopedRichContentPages = (product: Product): ScopedPage[] => [
   ...product.rich_content.map((page) => ({ page, scope: null })),
   ...product.variants.flatMap((variant) => variant.rich_content.map((page) => ({ page, scope: variant.id }))),
@@ -249,6 +279,83 @@ const applyCanonicalIds = (
   sentPagesById: ReadonlyMap<string, ScopedPage> = new Map(),
 ) => {
   const variantMappings = response.variant_id_mappings ?? {};
+  // Matching sent snapshots to current pages must be one-to-one: raw ids can
+  // repeat across scopes, and moves land while the request runs, so a page's
+  // current scoped key can point at ANOTHER page's sent entry (a chained
+  // move: A's page now sits in B while B's page moved on to C). The
+  // reconciliation_id stamped on every page at send time is exact identity —
+  // moves spread the page object, so the stamp travels with it. The passes
+  // after it recover pages whose stamp was lost to a flow that rebuilt the
+  // object, in confidence order, computed before the loops below rewrite ids
+  // in place:
+  //   1. an unmarked page sits where it was sent — its scoped key is identity;
+  //   2. a marked page whose scoped entry carries the SAME marker was sent in
+  //      place (its move predates the request);
+  //   3. a marked page's move began mid-flight from move_source_scope, so
+  //      that scope's entry is its snapshot (unless two pages contend);
+  //   4. a leftover page takes the only unclaimed entry with its raw id.
+  // Whatever stays unmatched reconciles without a snapshot, which skips the
+  // move bookkeeping rather than guessing (fail-safe).
+  const sentPageMatches = new Map<Page, ScopedPage>();
+  const claimedSentKeys = new Set<string>();
+  const currentScopedPages = allScopedRichContentPages(product);
+  const claimMatch = (page: Page, key: string) => {
+    if (sentPageMatches.has(page)) return;
+    const snapshot = sentPagesById.get(key);
+    if (!snapshot || claimedSentKeys.has(key)) return;
+    sentPageMatches.set(page, snapshot);
+    claimedSentKeys.add(key);
+  };
+  const sentPagesByReconciliationId = new Map<string, ScopedPage>();
+  for (const snapshot of sentPagesById.values()) {
+    if (snapshot.page.reconciliation_id) sentPagesByReconciliationId.set(snapshot.page.reconciliation_id, snapshot);
+  }
+  for (const { page } of currentScopedPages) {
+    const snapshot = page.reconciliation_id ? sentPagesByReconciliationId.get(page.reconciliation_id) : undefined;
+    if (snapshot) claimMatch(page, scopedRichContentPageKey(snapshot.scope, snapshot.page.id));
+  }
+  for (const { page, scope } of currentScopedPages) {
+    if (!hasMoveSourceScope(page)) claimMatch(page, scopedRichContentPageKey(scope, page.id));
+  }
+  for (const { page, scope } of currentScopedPages) {
+    if (sentPageMatches.has(page) || !hasMoveSourceScope(page)) continue;
+    const key = scopedRichContentPageKey(scope, page.id);
+    const snapshot = sentPagesById.get(key);
+    if (
+      snapshot &&
+      hasMoveSourceScope(snapshot.page) &&
+      snapshot.page.move_source_scope === page.move_source_scope &&
+      snapshot.page.move_source_id === page.move_source_id
+    ) {
+      claimMatch(page, key);
+    }
+  }
+  const markerContenders = new Map<string, Page[]>();
+  for (const { page } of currentScopedPages) {
+    if (sentPageMatches.has(page) || !hasMoveSourceScope(page)) continue;
+    const key = scopedRichContentPageKey(page.move_source_scope ?? null, page.id);
+    if (!sentPagesById.has(key) || claimedSentKeys.has(key)) continue;
+    markerContenders.set(key, [...(markerContenders.get(key) ?? []), page]);
+  }
+  for (const [key, pages] of markerContenders) {
+    if (pages.length === 1 && pages[0]) claimMatch(pages[0], key);
+  }
+  const unclaimedSentPagesByRawId = new Map<string, ScopedPage | null>();
+  for (const [key, snapshot] of sentPagesById) {
+    if (claimedSentKeys.has(key)) continue;
+    unclaimedSentPagesByRawId.set(snapshot.page.id, unclaimedSentPagesByRawId.has(snapshot.page.id) ? null : snapshot);
+  }
+  const rawIdContenders = new Map<string, Page[]>();
+  for (const { page } of currentScopedPages) {
+    if (sentPageMatches.has(page) || !unclaimedSentPagesByRawId.get(page.id)) continue;
+    rawIdContenders.set(page.id, [...(rawIdContenders.get(page.id) ?? []), page]);
+  }
+  for (const [rawId, pages] of rawIdContenders) {
+    const snapshot = unclaimedSentPagesByRawId.get(rawId);
+    if (snapshot && pages.length === 1 && pages[0]) {
+      claimMatch(pages[0], scopedRichContentPageKey(snapshot.scope, snapshot.page.id));
+    }
+  }
   const fileMappings = response.file_id_mappings ?? {};
   const variantTimestamps = response.variant_updated_at ?? {};
   const variantBaselines = response.variant_loaded_integrations ?? {};
@@ -273,6 +380,11 @@ const applyCanonicalIds = (
     return canonicalId ? { ...file, id: canonicalId } : file;
   });
   for (const variant of product.variants) {
+    // sentPagesById is keyed by the id this variant was SENT under, which for
+    // a variant created by this very save is the local id, not the canonical
+    // one assigned below — capture it before the remap or every page lookup
+    // for a newly-created variant misses (gumroad-private#2023 follow-up).
+    const sentVariantId = variant.id;
     const canonicalId = variantMappings[variant.id];
     if (canonicalId) {
       variant.id = canonicalId;
@@ -291,26 +403,79 @@ const applyCanonicalIds = (
     const variantBaseline = variantBaselines[variant.id];
     if (variantBaseline) variant.loaded_integrations = variantBaseline;
     for (const page of variant.rich_content) {
-      const sent = sentPagesById.get(page.id);
+      const sent = sentPageMatches.get(page);
       applyRichContentPageSaveResponse(
         page,
         response,
         sent?.page ?? page,
         variant.id,
         canonicalRichContentScope(sent?.scope, variantMappings),
+        // The server keyed this page's mapping by the scope it was SENT
+        // under, which for an in-flight move is not the current one.
+        sent !== undefined ? sent.scope : sentVariantId,
       );
     }
   }
   for (const page of product.rich_content) {
-    const sent = sentPagesById.get(page.id);
+    const sent = sentPageMatches.get(page);
     applyRichContentPageSaveResponse(
       page,
       response,
       sent?.page ?? page,
       null,
       canonicalRichContentScope(sent?.scope, variantMappings),
+      sent !== undefined ? sent.scope : null,
     );
   }
+};
+
+// Remaps confirmed page removals through the response's SCOPED id mappings:
+// the flat map is last-write-wins across scopes, and a raw id sent in two
+// scopes could remap a deletion onto a row the seller kept. Disagreeing
+// scopes tiebreak on the confirmed-removed variant; failing that the remap
+// is dropped, which can only block a save (unmapped ids are inert).
+const scopedConfirmedPageIdMappings = (
+  response: SaveProductResponse,
+  sentPagesById: ReadonlyMap<string, ScopedPage>,
+  confirmedRemovedVariantIds: string[],
+): Record<string, string> => {
+  const byScope = response.rich_content_id_mappings_by_scope;
+  const mappings = { ...response.rich_content_id_mappings };
+  if (!byScope) return mappings;
+
+  const canonicalsByRawId = new Map<string, Map<string, string>>();
+  for (const scopedPage of sentPagesById.values()) {
+    const scopeKey = scopedPage.scope ?? "";
+    const canonical = byScope[scopeKey]?.[scopedPage.page.id];
+    if (!canonical) continue;
+    const perScope = canonicalsByRawId.get(scopedPage.page.id) ?? new Map<string, string>();
+    perScope.set(scopeKey, canonical);
+    canonicalsByRawId.set(scopedPage.page.id, perScope);
+  }
+
+  const confirmedVariantIds = new Set(confirmedRemovedVariantIds);
+  const ambiguousRawIds = new Set<string>();
+  for (const [rawId, perScope] of canonicalsByRawId) {
+    const [onlyCanonical, ...others] = new Set(perScope.values());
+    if (onlyCanonical && others.length === 0) {
+      mappings[rawId] = onlyCanonical;
+      continue;
+    }
+    const removedScopeCanonicals = [...perScope.entries()].filter(([scopeKey]) => confirmedVariantIds.has(scopeKey));
+    const tiebreak = removedScopeCanonicals.length === 1 ? removedScopeCanonicals[0] : undefined;
+    if (tiebreak) {
+      mappings[rawId] = tiebreak[1];
+    } else {
+      ambiguousRawIds.add(rawId);
+    }
+  }
+  if (ambiguousRawIds.size === 0) return mappings;
+  const unambiguousMappings: Record<string, string> = {};
+  for (const rawId in mappings) {
+    const canonical = mappings[rawId];
+    if (canonical && !ambiguousRawIds.has(rawId)) unambiguousMappings[rawId] = canonical;
+  }
+  return unambiguousMappings;
 };
 
 const findUpdatedContent = (product: Product, lastSavedProduct: Product) => {
@@ -352,6 +517,10 @@ const ProductEditPage = (props: Props) => {
   // in-flight save() promise so callers awaiting save() (e.g. "Save and
   // continue") settle once the seller decides.
   const [pendingDeletions, setPendingDeletions] = React.useState<PendingDeletions | null>(null);
+  // Content present at the last save but gone from browser state without any
+  // recorded deletion intent. Non-null while the reload modal is open; every
+  // save attempt is blocked until the seller reloads (see runSave).
+  const [missingContentConflict, setMissingContentConflict] = React.useState<PendingDeletions | null>(null);
   const pendingSaveRef = React.useRef<((saved: boolean) => void) | null>(null);
   // Hidden version-level pages the server refused to delete without an
   // explicit choice (see HiddenVariantContentConflictError). Non-null while
@@ -420,6 +589,19 @@ const ProductEditPage = (props: Props) => {
         preserved_rich_content_ids: conflictResolution.hiddenPageIds,
       };
     }
+    // Stamp every page with its client-only identity before freezing the
+    // snapshot: reconciliation matches each page back to its sent snapshot by
+    // this stamp, because scope, id, and move marker together cannot always
+    // tell same-id pages apart once moves land mid-request (see Page).
+    // Stamping mutates the live page objects on purpose — the seller's moves
+    // spread those objects, carrying the stamp to wherever the page is when
+    // the response returns.
+    for (const page of [
+      ...productToSave.rich_content,
+      ...productToSave.variants.flatMap((variant) => variant.rich_content),
+    ]) {
+      page.reconciliation_id ??= GuidGenerator.generate();
+    }
     // Freeze the exact request snapshot before awaiting the network. The seller
     // can keep editing while a save runs; response reconciliation must update
     // those later edits without pretending they were part of this request.
@@ -429,7 +611,10 @@ const ProductEditPage = (props: Props) => {
       ...new Set([...(productSent.confirmed_removed_rich_content_ids ?? []), ...richContentMoveSourceIds(productSent)]),
     ];
     const sentPagesById = new Map(
-      allScopedRichContentPages(productSent).map((scopedPage) => [scopedPage.page.id, scopedPage]),
+      allScopedRichContentPages(productSent).map((scopedPage) => [
+        scopedRichContentPageKey(scopedPage.scope, scopedPage.page.id),
+        scopedPage,
+      ]),
     );
     const sentConfirmedVariantIds = new Set(productSent.confirmed_removed_variant_ids ?? []);
     try {
@@ -464,11 +649,29 @@ const ProductEditPage = (props: Props) => {
       reconciled.confirmed_removed_rich_content_ids = [];
       lastSavedProductRef.current = reconciled;
       setVariantIdMappings((previous) => ({ ...previous, ...response.variant_id_mappings }));
-      setRichContentIdMappings((previous) => ({ ...previous, ...response.rich_content_id_mappings }));
+      setRichContentIdMappings((previous) => {
+        const scopedMappings = Object.entries(response.rich_content_id_mappings_by_scope ?? {}).flatMap(
+          ([scope, mappings]) => {
+            const canonicalScope = scope === "" ? null : (response.variant_id_mappings?.[scope] ?? scope);
+            return Object.entries(mappings).map(
+              ([id, canonicalId]) => [scopedRichContentPageKey(canonicalScope, id), canonicalId] as const,
+            );
+          },
+        );
+        return { ...previous, ...response.rich_content_id_mappings, ...Object.fromEntries(scopedMappings) };
+      });
       setFileIdMappings((previous) => ({ ...previous, ...response.file_id_mappings }));
       setRichContentRemovedFileEmbedIds(response.rich_content_removed_file_embed_ids ?? {});
       updateProduct((current) => {
         applyCanonicalIds(current, response, sentPagesById);
+        // Read before the variant reconcile below remaps the list: the
+        // confirmed ids and the sent snapshot's scope keys share the
+        // sent-era id namespace.
+        const confirmedPageIdMappings = scopedConfirmedPageIdMappings(
+          response,
+          sentPagesById,
+          current.confirmed_removed_variant_ids ?? [],
+        );
         current.confirmed_removed_variant_ids = reconcileConfirmedRemovalIds(
           current.confirmed_removed_variant_ids ?? [],
           sentConfirmedVariantIds,
@@ -477,7 +680,7 @@ const ProductEditPage = (props: Props) => {
         current.confirmed_removed_rich_content_ids = reconcileConfirmedRemovalIds(
           current.confirmed_removed_rich_content_ids ?? [],
           sentConfirmedPageIds,
-          response.rich_content_id_mappings,
+          confirmedPageIdMappings,
         );
       });
 
@@ -519,21 +722,29 @@ const ProductEditPage = (props: Props) => {
     setSaving(false);
     return saved;
   };
-  const save = async (): Promise<boolean> => {
+  const runSave = (): Promise<boolean> => {
+    const { confirmed, unexpected } = findPendingDeletions(product, lastSavedProductRef.current);
+    // Content missing without recorded intent means the session lost state:
+    // fail closed and ask for a reload instead of offering it as a deletion.
+    if (unexpected.variants.length + unexpected.pages.length > 0) {
+      setMissingContentConflict(unexpected);
+      return Promise.resolve(false);
+    }
     // A save that deletes existing versions/tiers or content pages gets one
     // final summary confirmation before the request goes out. Each deletion
     // already had its own modal when the seller clicked delete, but this is
     // the last chance to notice an accumulated (possibly large) wipe before
     // it becomes permanent.
-    const deletions = findPendingDeletions(product, lastSavedProductRef.current);
-    if (deletions.variants.length + deletions.pages.length > 0) {
-      setPendingDeletions(deletions);
+    if (confirmed.variants.length + confirmed.pages.length > 0) {
+      setPendingDeletions(confirmed);
       return new Promise<boolean>((resolve) => {
         pendingSaveRef.current = resolve;
       });
     }
     return performSave();
   };
+  const saveKey = React.useMemo(() => ({ product, currencyType }), [product, currencyType]);
+  const save = useDedupeInFlight(saveKey, runSave, (saved) => saved);
   const confirmDeletionsAndSave = async () => {
     setPendingDeletions(null);
     const saved = await performSave();
@@ -668,6 +879,40 @@ const ProductEditPage = (props: Props) => {
                 </div>
               ) : null}
               <p>Customers who purchased this content will lose access to it.</p>
+            </div>
+          </Modal>
+        ) : null}
+        {missingContentConflict ? (
+          <Modal
+            open
+            onClose={() => setMissingContentConflict(null)}
+            title="Some content couldn't be loaded"
+            footer={
+              <>
+                <Button onClick={() => setMissingContentConflict(null)}>Keep editing</Button>
+                <Button color="accent" onClick={() => window.location.reload()}>
+                  Reload page
+                </Button>
+              </>
+            }
+          >
+            <div className="flex flex-col gap-4">
+              <p>This editor session lost track of the following content, so saving could permanently delete it:</p>
+              {missingContentConflict.variants.length > 0 ? (
+                <ul className="list-disc pl-6">
+                  {missingContentConflict.variants.map(({ id, name }) => (
+                    <li key={id}>{name || "Untitled"}</li>
+                  ))}
+                </ul>
+              ) : null}
+              {missingContentConflict.pages.length > 0 ? (
+                <ul className="list-disc pl-6">
+                  {missingContentConflict.pages.map(({ id, title }) => (
+                    <li key={id}>{titleWithFallback(title)}</li>
+                  ))}
+                </ul>
+              ) : null}
+              <p>Nothing was saved or deleted. Reload the page to keep editing with the full content.</p>
             </div>
           </Modal>
         ) : null}

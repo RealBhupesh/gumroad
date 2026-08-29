@@ -24,8 +24,13 @@ class RedisKey
     def api_v2_sales_page_key_query_timeout = "api_v2_sales_page_key_query_timeout"
     def free_purchases_watch_hours = "free_purchases_watch_hours"
     def max_allowed_free_purchases_of_same_product = "max_allowed_free_purchases_of_same_product"
+    def auto_topup_negative_destination_balance_last_amount(merchant_account_id) = "auto_topup_negative_destination_balance:#{merchant_account_id}:last_amount_cents"
     def ai_request_throttle(user_id) = "ai_request_throttle:#{user_id}"
     def agent_request_throttle(user_id) = "agent_request_throttle:#{user_id}"
+    def gumhead_gateway_throttle(user_id) = "gumhead_gateway_throttle:#{user_id}"
+    def gumhead_gateway_in_flight(user_id) = "gumhead_gateway_in_flight:#{user_id}"
+    def gumhead_model_map = "gumhead_model_map"
+    def gumhead_client_versions = "gumhead_client_versions"
     def agent_turn_status(user_id, client_turn_id) = "agent_turn_status:#{user_id}:#{client_turn_id}"
     def agent_custom_html_preview(user_id, token) = "agent_custom_html_preview:#{user_id}:#{token}"
     def agent_custom_html_preview_index(user_id) = "agent_custom_html_preview_index:#{user_id}"
@@ -39,6 +44,11 @@ class RedisKey
     def blast_sent_emails(blast_id) = "blast:#{blast_id}:sent_emails"
     def blast_audience_snapshot(blast_id) = "blast:#{blast_id}:audience_snapshot"
     def blast_non_opener_emails(blast_id) = "blast:#{blast_id}:non_opener_emails"
+    def blast_pending_recipients(blast_id) = "blast:#{blast_id}:pending_recipients"
+    def stalled_blast_auto_resumed(blast_id) = "blast:#{blast_id}:auto_resumed"
+    def stalled_blast_completion_resumed(blast_id) = "blast:#{blast_id}:completion_resumed"
+    def workflow_installment_rule_version(installment_id) = "workflow_installment_rule:#{installment_id}:version"
+    def workflow_installment_rule_pending_token(installment_id) = "workflow_installment_rule:#{installment_id}:pending_token"
     def audience_member_load_max_execution_time_seconds = "audience_member_load:max_execution_time_seconds"
     def impersonated_user(admin_user_id) = "impersonated_user_by_admin_#{admin_user_id}"
     def undeliverable_ping_subscription_notified(resource_subscription_id, reason) = "undeliverable_ping_subscription:#{resource_subscription_id}:#{reason}"
@@ -87,6 +97,12 @@ class RedisKey
     # High-water mark for AlertSellersOfUndeliveredReceiptsJob: the last email_infos id it judged.
     def undelivered_receipt_sweep_cursor = "undelivered_receipt_sweep:cursor"
     def stale_block_sweep_cursor = "stale_block_sweep:cursor"
+    # How far RecoverStrandedBuyersJob has rotated a SPECIFIC oversized-bucket page (bucket_id,
+    # cycle) so a run that hits RUN_BUDGET partway through doesn't restart that page at the same
+    # buyer next occurrence. Keyed per page, not per bucket: a bucket's several pages are all
+    # reached in turn, and a cursor shared across them would accumulate identically regardless of
+    # which page ran, so on same-sized pages it always lands back on the same prefix.
+    def recover_stranded_buyers_page_cursor(page_key) = "recover_stranded_buyers:page_cursor:#{page_key.join(":")}"
     # High-water mark for RepairOrderChargeOutcomesJob's backlog pass: the last orders id it walked.
     def order_charge_outcome_repair_cursor = "order_charge_outcome_repair:cursor"
     # Fixed at lap start so the walk keeps making forward progress even while new failing orders
@@ -102,5 +118,13 @@ class RedisKey
     # only for the length of one render; `product_reviews.seller_notified_at` is what records that
     # the seller was told. See ContactingCreatorMailer#review_submitted.
     def product_review_seller_notified(review_id) = "product_review_seller_notified:#{review_id}"
+    def workflow_seller_fanout_lock(seller_id) = "workflow_seller_fanout_lock:#{seller_id}"
+    def workflow_seller_fanout_lock_ttl_seconds = "workflow_seller_fanout_lock_ttl_seconds"
+    def workflow_seller_fanout_retry_seconds = "workflow_seller_fanout_retry_seconds"
+    def workflow_immediate_fanout_threshold = "workflow_immediate_fanout_threshold"
+    def workflow_immediate_enqueue_per_second = "workflow_immediate_enqueue_per_second"
+    def workflow_immediate_fanout_max_spread_seconds = "workflow_immediate_fanout_max_spread_seconds"
+    def seller_large_blast_threshold = "seller_large_blast_threshold"
+    def seller_large_blast_quota(seller_id, day) = "seller_large_blast_quota:#{seller_id}:#{day}"
   end
 end

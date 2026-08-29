@@ -8,6 +8,8 @@ import { PurchasePaymentMethod } from "$app/data/purchase";
 import { SavedCreditCard } from "$app/parsers/card";
 import { CustomFieldDescriptor, ProductNativeType } from "$app/parsers/product";
 import { assert } from "$app/utils/assert";
+import { readBuyerCurrencyPreference, writeBuyerCurrencyPreference } from "$app/utils/buyerCurrencyPreference";
+import { GST_ONLY_FALLBACK_PROVINCE, provinceForCanadianPostalCode } from "$app/utils/canadianPostalCodes";
 import { isValidEmail } from "$app/utils/email";
 import { calculateFirstInstallmentPaymentPriceCents } from "$app/utils/price";
 import { asyncVoid } from "$app/utils/promise";
@@ -56,19 +58,10 @@ export type PaymentElementConfig = {
   payment_method_creation: "manual";
   stripe_link_enabled: boolean;
 };
-// Client-confirm checkout mints a ConfirmationToken from the Payment Element, so it omits
-// payment_method_creation and stays in one-time payment mode. The method list is
-// server-resolved (Checkout::PaymentMethodResolver) and must match the deferred intent's;
-// the browser never widens it — card and Link everywhere (stripe_link_enabled reflects the
-// resolved set; Link auto-enables with the Payment Element, dropped only by the PPP gate), plus
-// the US-locked methods (cashapp, us_bank_account) for US buyers. Recurring UPI registration is
-// the narrow card + UPI exception.
-// Currency is "usd" everywhere except direct-listed and method-forced (iDEAL/Bancontact/UPI)
-// surfaces. Those mount in the listed currency with the listed subtotal so the Element, checkout
-// summary, and deferred intent stay aligned; when presentment_amount_cents is null the amount
-// derives from the USD total below.
-// listed_currency_display is non-null on that same surface and tells the checkout summary to
-// render the cart in the listed currency, matching what the element and the charge use.
+// Client-confirm mints a ConfirmationToken, so it omits payment_method_creation.
+// payment_method_types is server-resolved and must match the deferred intent — the
+// browser never widens it. Currency is usd except on direct-listed / method-forced
+// surfaces, which mount in the listed currency so the Element, summary, and intent stay aligned.
 export type ListedCurrencyDisplayConfig = {
   currency: string;
   // The backend's authoritative minor-unit scale for the currency, so formatting never relies on
@@ -91,26 +84,18 @@ export type PaymentElementClientConfirmConfig = {
   stripe_link_enabled: boolean;
   stripe_connect_account_id: string | null;
 };
-// Every integration variant also carries `request_apple_pay_merchant_tokens` — a per-seller
-// rollout flag: when true, subscription carts declare recurring intent on the Apple Pay sheet so
-// Apple issues a device-independent merchant token (MPAN) instead of a device token. It applies
-// to the wallet button regardless of which card integration is active.
-// `payment_element_wallets` is another per-seller rollout flag: when true, the Payment Element
-// renders Apple Pay/Google Pay natively and the separate Payment Request Button is not mounted
-// for that cart (antiwork/gumroad#5768). It is always false on the card_element fallback lane,
-// which has no Payment Element to render wallets in.
-// `flat_payment_methods` selects the flat payment-methods list (the element's accordion is the
-// payment-method selector; PayPal appends as one more row — see PaymentMethodsSection in
-// PaymentForm.tsx). Server-owned and independent of `payment_element_wallets` since the layout
-// was decoupled from the wallet rollout: wallet-suppressed carts (disable_wallets) get the same
-// flat list without wallet rows. Always false on the card_element lane, which has no element to
-// act as the selector.
+// request_apple_pay_merchant_tokens: subscription carts ask Apple for an MPAN (survives a
+// device wipe) instead of a device token. payment_element_wallets: PE renders wallets
+// natively and the Payment Request Button is not mounted; always false on card_element.
+// flat_payment_methods is independent of that flag (wallet-suppressed carts stay flat);
+// always false on card_element, which has no accordion to act as the selector.
 export type CheckoutPaymentConfig =
   | {
       integration: "card_element";
       fallback_reason: string;
       disable_wallets: boolean;
       request_apple_pay_merchant_tokens: boolean;
+      india_card_mandate_reliability?: boolean;
       payment_element_wallets: boolean;
       flat_payment_methods: boolean;
       elements_options: null;
@@ -120,6 +105,7 @@ export type CheckoutPaymentConfig =
       fallback_reason: null;
       disable_wallets: boolean;
       request_apple_pay_merchant_tokens: boolean;
+      india_card_mandate_reliability?: boolean;
       payment_element_wallets: boolean;
       flat_payment_methods: boolean;
       elements_options: PaymentElementConfig;
@@ -130,6 +116,7 @@ export type CheckoutPaymentConfig =
       recurring_upi_registration: boolean;
       disable_wallets: boolean;
       request_apple_pay_merchant_tokens: boolean;
+      india_card_mandate_reliability?: boolean;
       payment_element_wallets: boolean;
       flat_payment_methods: boolean;
       elements_options: PaymentElementClientConfirmConfig;
@@ -175,6 +162,7 @@ export type Product = {
   nativeType: ProductNativeType;
   recurrence: RecurrenceId | null;
   subscription_id?: string;
+  forceNewSubscription?: boolean;
   recommended_by?: string | null;
   shippableCountryCodes: string[];
 };
@@ -203,8 +191,80 @@ export type Tip =
       listedAmount?: number | null;
     };
 
+// Whether a response's currency menu offers `code`. Undefined when the response carries no menu
+// at all: a server from before the picker shipped says nothing about which currencies it can
+// quote, and reading its silence as a refusal would reject every choice during a rolling deploy.
+const offersBuyerCurrency = (surcharges: SurchargesResponse, code: string) =>
+  surcharges.available_buyer_currencies?.some((option) => option.code === code);
+
+type CheckoutTaxLocation = { country: string; state: string; zipCode: string };
+type PayPalBillingAddressTaxLocation = {
+  country: string;
+  zipCode: string | undefined;
+  state?: string | null | undefined;
+};
+
+const paypalBillingStateForCheckout = (
+  billingAddress: PayPalBillingAddressTaxLocation,
+  checkout: CheckoutTaxLocation,
+) =>
+  billingAddress.state ||
+  (billingAddress.country === "CA" ? provinceForCanadianPostalCode(billingAddress.zipCode) : null) ||
+  (billingAddress.country === checkout.country ? checkout.state : null) ||
+  (billingAddress.country === "CA" ? GST_ONLY_FALLBACK_PROVINCE : null) ||
+  "";
+
+export const paypalBillingAddressForCheckout = (
+  billingAddress: PayPalBillingAddressTaxLocation,
+  checkout: CheckoutTaxLocation,
+) => ({
+  country: billingAddress.country,
+  zipCode: billingAddress.zipCode || (billingAddress.country === checkout.country ? checkout.zipCode : ""),
+  state: paypalBillingStateForCheckout(billingAddress, checkout),
+});
+
+export const paypalBillingAddressChangesTaxLocation = (
+  billingAddress: PayPalBillingAddressTaxLocation,
+  checkout: CheckoutTaxLocation,
+) => {
+  const next = paypalBillingAddressForCheckout(billingAddress, checkout);
+  return (
+    next.country !== checkout.country ||
+    (next.country === "US" && next.zipCode !== checkout.zipCode) ||
+    (next.country === "CA" && next.state !== checkout.state)
+  );
+};
+
+export { readBuyerCurrencyPreference, writeBuyerCurrencyPreference };
+
 export type State = {
   products: Product[];
+  buyerCurrency: string | null;
+  // The quote that was on screen when the buyer changed currency (or switched payment surface),
+  // held only until the replacement lands. Both leave the cart alone, and a currency change is the
+  // one whose control lives inside the summary it blanks, so the summary renders from this
+  // snapshot to keep its rows — and the picker the buyer is still holding focus in — in place
+  // across the round trip. `previousCurrency` is what the selection goes back to if the chosen
+  // currency turns out to be unquotable.
+  buyerCurrencyRemint: {
+    surcharges: SurchargesResponse;
+    previousCurrency: string | null;
+    // Set when the refetch was a payment-surface switch (saved card ⇄ Payment Element) rather
+    // than the buyer picking a currency. Those switches change which currencies the server
+    // advertises but leave the selection alone, so there is nothing to put back and no refusal
+    // to report — the snapshot is held only so the summary keeps its amounts across the trip.
+    surfaceSwitch?: boolean;
+    // The surface the buyer was on when a surface-switch snapshot was taken. Which currency the
+    // summary is in is a function of that surface — a saved card charges canonical USD, a new
+    // card can charge the listed currency — so rendering the held amounts under the NEW surface
+    // flips them between listed and USD the instant the toggle moves, which is the mid-flight
+    // total change the snapshot exists to prevent. Display only; pay and disable gates keep
+    // reading live `usingSavedCard`.
+    previousUsingSavedCard?: boolean;
+  } | null;
+  // A currency the buyer chose that the server then came back without. The summary names it, so a
+  // total that reverts to another currency says why instead of changing under the buyer.
+  unavailableBuyerCurrency: string | null;
   countries: Record<string, string>;
   usStates: string[];
   caProvinces: string[];
@@ -324,13 +384,24 @@ type SimpleValue =
   | "payLabel"
   | "warning"
   | "tip"
-  | "emailTypoSuggestion";
+  | "emailTypoSuggestion"
+  | "buyerCurrency";
 
 type PublicAction =
   | ({ type: "set-value" } & Partial<{ [key in SimpleValue]?: State[key] | undefined }>)
   // A wallet sheet's billing address adopted as checkout's tax location mid-payment (see the
   // reducer case for why this is not a plain "set-value").
   | { type: "set-wallet-billing-address"; country: string; zipCode: string | undefined; state: string }
+  // PayPal returns the account tax location after the buyer approves the agreement. If that
+  // changes the taxable location, the buyer has to review the updated total before any capture.
+  | {
+      type: "set-paypal-billing-address";
+      country: string;
+      zipCode: string | undefined;
+      state?: string | null | undefined;
+      fullName: string;
+      email?: string;
+    }
   | { type: "set-custom-field"; key: string; value: string }
   | { type: "add-payment-method"; paymentMethod: PaymentMethod }
   | { type: "offer" }
@@ -400,7 +471,11 @@ export function requiresPaymentElementReusablePaymentMethod(state: State) {
 }
 
 export function requiresReusablePaymentMethodForCardCollection(state: State, useStripePaymentElement: boolean) {
-  if (!useStripePaymentElement) return requiresReusablePaymentMethod(state);
+  if (!useStripePaymentElement) {
+    return state.checkoutPayment.india_card_mandate_reliability
+      ? requiresPaymentElementReusablePaymentMethod(state)
+      : requiresReusablePaymentMethod(state);
+  }
   if (
     state.checkoutPayment.integration === "payment_element" &&
     state.checkoutPayment.elements_options.stripe_elements_mode === STRIPE_ELEMENTS_MODE_FOR_SETUP_INTENT
@@ -497,7 +572,8 @@ export function getStripePaymentElementAmount(state: State) {
   if (
     state.checkoutPayment.integration === "payment_element_client_confirm" &&
     state.checkoutPayment.elements_options.presentment_amount_cents !== null &&
-    (!state.checkoutPayment.elements_options.direct_listed_card || directListedCardActive(state))
+    (!state.checkoutPayment.elements_options.direct_listed_card ||
+      (getSelectableDirectListedCurrency(state) !== null && state.buyerCurrency?.toLowerCase() !== "usd"))
   )
     return state.checkoutPayment.elements_options.presentment_amount_cents;
   // Buyer-currency presentment lane: the element mounts in the quote currency, so the amount
@@ -525,6 +601,7 @@ export function getStripePaymentElementPresentment(state: State): { currency: st
     cartPermalinks: state.products.map((product) => product.permalink),
     willSaveCard: state.willSaveCard,
     paymentMethod: state.paymentMethod,
+    paymentElementType: state.paymentElementType,
   });
   if (!display) return null;
 
@@ -537,8 +614,8 @@ export function getStripePaymentElementPresentment(state: State): { currency: st
 // preserves the current Element instead of remounting and wiping entered card details.
 export function getStripePaymentElementMountCurrency(state: State): string | null {
   if (state.checkoutPayment.integration === "payment_element_client_confirm") {
-    const elementsOptions = state.checkoutPayment.elements_options;
-    return elementsOptions.direct_listed_card && !directListedCardActive(state) ? "usd" : elementsOptions.currency;
+    if (getConfiguredDirectListedCurrency(state) !== null && state.surcharges.type !== "loaded") return null;
+    return getDesiredStripePaymentElementMountCurrency(state);
   }
   if (state.checkoutPayment.integration !== "payment_element") return null;
   const elementsOptions = state.checkoutPayment.elements_options;
@@ -547,8 +624,56 @@ export function getStripePaymentElementMountCurrency(state: State): string | nul
   return getStripePaymentElementPresentment(state)?.currency ?? elementsOptions.currency;
 }
 
-function directListedCardActive(state: State) {
-  return state.paymentMethod === "card" && !state.usingSavedCard && computeTip(state) === 0 && !hasShipping(state);
+export function getConfiguredDirectListedCurrency(state: Pick<State, "checkoutPayment">): string | null {
+  if (state.checkoutPayment.integration !== "payment_element_client_confirm") return null;
+
+  const options = state.checkoutPayment.elements_options;
+  const currency = options.currency.toLowerCase();
+  if (!options.direct_listed_card || options.presentment_amount_cents === null || options.presentment_amount_cents <= 0)
+    return null;
+  if (options.listed_currency_display?.currency.toLowerCase() !== currency) return null;
+
+  return currency;
+}
+
+// `usingSavedCard` defaults to the live surface. The summary passes the surface a surface-switch
+// remint was taken on instead, so its held amounts stay in the currency they were quoted in until
+// the replacement lands — see getDisplayedUsingSavedCard.
+export function getSelectableDirectListedCurrency(
+  state: State,
+  { usingSavedCard = state.usingSavedCard }: { usingSavedCard?: boolean } = {},
+): string | null {
+  const currency = getConfiguredDirectListedCurrency(state);
+  if (!currency || !directListedCardActive(state, usingSavedCard) || !canUseStripePaymentElementClientConfirm(state))
+    return null;
+
+  return currency;
+}
+
+// The payment surface the summary renders as of: the pre-toggle one while a surface-switch remint
+// is still on screen, the live one otherwise.
+export function getDisplayedUsingSavedCard(state: Pick<State, "usingSavedCard" | "buyerCurrencyRemint">): boolean {
+  const remint = state.buyerCurrencyRemint;
+  return remint?.surfaceSwitch ? (remint.previousUsingSavedCard ?? state.usingSavedCard) : state.usingSavedCard;
+}
+
+function getDesiredStripePaymentElementMountCurrency(state: State): string | null {
+  if (state.checkoutPayment.integration !== "payment_element_client_confirm") return null;
+
+  const configuredDirectListedCurrency = getConfiguredDirectListedCurrency(state);
+  if (!configuredDirectListedCurrency) {
+    return state.checkoutPayment.elements_options.direct_listed_card
+      ? "usd"
+      : state.checkoutPayment.elements_options.currency;
+  }
+
+  return getSelectableDirectListedCurrency(state) !== null && state.buyerCurrency?.toLowerCase() !== "usd"
+    ? configuredDirectListedCurrency
+    : "usd";
+}
+
+function directListedCardActive(state: State, usingSavedCard = state.usingSavedCard) {
+  return state.paymentMethod === "card" && !usingSavedCard && computeTip(state) === 0 && !hasShipping(state);
 }
 
 export function isProcessing(state: State) {
@@ -617,18 +742,10 @@ export function computeTipForPrice(state: State, price: number, permalink: strin
   return Math.round((state.tip.percentage / 100) * price);
 }
 
-// Computes each cart line's tip so the per-line integers sum exactly to the tip the buyer
-// selected (the same figure TipSelector / Subtotal / confirm show via `computeTip`, or its
-// listed-currency counterpart). `computeTipForPrice` rounds each line independently, which
-// overshoots for both tip types: two equal items with a 1-cent fixed tip each round to 1 cent
-// (2 charged vs 1 chosen), and prices like [999, 1999, 2999] at 20% round to 200+400+600 = 1200
-// while `computeTip` is 1199. Both tip types therefore use largest-remainder allocation (floor
-// every line's exact proportional share, then hand leftover cents to the lines with the largest
-// fractional parts). Every consumer that builds per-line money for the server (the surcharge
-// quote request and the order's line items) must use this same function, because the
-// buyer-currency quote token is verified at charge time by comparing the quote's line totals
-// against the purchases': two call sites rounding differently would make every affected charge
-// fail verification.
+// Per-line tips that sum exactly to the cart tip. computeTipForPrice rounds each line
+// independently and overshoots (1¢ fixed on two items → 2¢; [999,1999,2999] @ 20% → 1200
+// vs computeTip 1199). Largest-remainder. Surcharge quotes and order lines must share this
+// function: the quote token is verified against purchase line totals.
 export function computeTipsForLines(
   state: State,
   lines: { price: number; permalink: string | undefined }[],
@@ -659,22 +776,10 @@ export function computeTipsForLines(
   return allocateFixedTipCents(tipCents, lines, totalPriceCents);
 }
 
-// The tip to DISPLAY on the method-forced listed-currency lane, in the listed currency's minor
-// units: the exact figure the order will submit, obtained by running the submission's own
-// allocation over the same per-line bases.
-//
-// The tip lives in checkout state as canonical USD cents on every lane (`computeTip` takes its
-// percentage of `getTotalPriceFromProducts`, and those prices are built with `convertToUSD`), so
-// something has to turn it into listed units for display. Doing that arithmetic separately is what
-// went wrong twice on this lane: a percentage tip re-derived from the canonical figure rounds twice
-// and lands a minor unit low, and a fixed tip converted at the exchange rate disagrees with
-// `allocateFixedTipCents`, which floors each line's exact share and then hands out the leftover
-// minor units. Both were display/charge mismatches of exactly the kind this lane exists to remove.
-//
-// Rather than keep a parallel conversion in step with the allocator, ask the allocator. Callers pass
-// the same per-line prices they will submit — each line's `getDiscountedPrice(...)`, in the
-// product's own minor units — so display and charge agree by construction, for both tip types and
-// for any future change to how tips are split.
+// Listed-lane display tip, in the listed currency's minor units. Do not convert the
+// canonical computeTip figure: a percentage double-rounds one unit low, and a fixed tip
+// converted at the FX rate disagrees with allocateFixedTipCents. Callers pass the same
+// getDiscountedPrice(...) bases the order will submit so display and charge match.
 export function computeTipForListedLines(state: State, lines: { price: number; permalink: string | undefined }[]) {
   return computeTipsForLines(state, lines, { basis: "listed" }).reduce<number>((sum, tip) => sum + (tip ?? 0), 0);
 }
@@ -718,10 +823,11 @@ function computeTipForFreeCart(state: State, permalink?: string): number {
   return 0;
 }
 
+export const getTotalPriceFromSurcharges = (surcharges: SurchargesResponse | null) =>
+  surcharges ? surcharges.subtotal + surcharges.tax_cents + surcharges.shipping_rate_cents : null;
+
 export function getTotalPrice(state: State) {
-  return state.surcharges.type === "loaded"
-    ? state.surcharges.result.subtotal + state.surcharges.result.tax_cents + state.surcharges.result.shipping_rate_cents
-    : null;
+  return getTotalPriceFromSurcharges(state.surcharges.type === "loaded" ? state.surcharges.result : null);
 }
 
 // The pre-tax sum of all future installment payments. Besides the summary row, this is the
@@ -761,32 +867,20 @@ export function getCustomFieldKey(
 
 export const hasShipping = (state: State) => state.products.some((item) => item.requireShipping);
 
-// Whether the Stripe Payment Element is collecting the buyer's FULL billing details itself for
-// the current selection (the "element-full" collection mode — UPI on digital carts, see
-// paymentElementBillingDetailsCollection in card_payment_method_data.ts). Mirrors that rule
-// instead of importing it: card_payment_method_data.ts already imports from this module, and a
-// value import back would create a module cycle. When this is true, checkout's own form hides
-// its Country/ZIP fields (the element's pane asks for the full street address with Stripe's
-// localized labels and validation) and the ZIP requirement for US buyers is waived — the buyer
-// types their postal code into the element instead. The Full name field stays visible: the
-// pane's name field is pinned to "never" and tokenization passes the form's name (see
-// paymentElementBillingDetailsOverride). Guarded on the card/element lane being checkout's
-// active payment method: a buyer who selected UPI inside the element and then switched to
-// PayPal pays with PayPal's own flow, and the form's fields must come back.
+// UPI on digital carts: the Payment Element collects full billing details. Duplicated from
+// paymentElementBillingDetailsCollection to avoid a cycle with card_payment_method_data.ts.
+// Hide Country/ZIP (the element collects them) but keep Full name — the pane's name field
+// is "never". False again if the buyer leaves the card/element lane (e.g. PayPal).
 export const paymentElementCollectsFullBillingDetails = (state: State) =>
   state.paymentMethod === "card" &&
   state.paymentElementType === "upi" &&
   !hasShipping(state) &&
   (canUseStripePaymentElement(state) || canUseStripePaymentElementClientConfirm(state));
 
-// Whether the currently selected Payment Element method needs `billing_details.name` from
-// checkout's own Full name field. The list of such methods lives in
-// $app/data/payment_element_methods (a cycle-free module, since card_payment_method_data.ts and
-// this module import each other). Bancontact is the case this exists for: Stripe rejects its
-// authorization without a name, but unlike UPI it stays in "form" collection mode, so
-// paymentElementCollectsFullBillingDetails is false for it and the name would otherwise never be
-// required on a digital cart (gumroad-private#1306). Guarded on the card/element lane for the
-// same reason as above: switching to PayPal must not keep the requirement.
+// Bancontact needs billing_details.name but stays in "form" collection mode, so the
+// full-details helper above is false and a digital cart would otherwise skip the name
+// field (gumroad-private#1306). Method list lives in $app/data/payment_element_methods
+// to stay cycle-free. Drop the requirement if the buyer leaves the card/element lane.
 export const paymentElementRequiresBillingNameForSelection = (state: State) =>
   state.paymentMethod === "card" &&
   paymentElementRequiresBillingName(state.paymentElementType) &&
@@ -796,6 +890,15 @@ export const getErrors = (state: State) => (state.status.type === "input" ? stat
 
 export const loadSurcharges = (state: State, abortSignal?: AbortSignal) => {
   const isGift = state.gift !== null;
+  const paymentDetailsSource = state.usingSavedCard
+    ? "saved_payment_method"
+    : state.paymentMethod === "card" && canUseStripePaymentElementClientConfirm(state)
+      ? "payment_element"
+      : undefined;
+  const paymentElementMountCurrency =
+    paymentDetailsSource === "payment_element" ? getDesiredStripePaymentElementMountCurrency(state) : null;
+  const paymentElementDirectListedCurrency =
+    paymentDetailsSource === "payment_element" ? getSelectableDirectListedCurrency(state) : null;
   // Allocate the tip across cart lines in one pass so the per-line integers sum to the
   // tip the buyer selected — rounding each line independently can send more total tip
   // than the buyer chose (see computeTipsForLines).
@@ -822,6 +925,12 @@ export const loadSurcharges = (state: State, abortSignal?: AbortSignal) => {
       state: state.state,
       vat_id: state.vatId,
       postal_code: state.zipCode,
+      ...(state.buyerCurrency ? { buyer_currency: state.buyerCurrency } : {}),
+      ...(paymentDetailsSource ? { payment_details_source: paymentDetailsSource } : {}),
+      ...(paymentElementMountCurrency ? { payment_element_mount_currency: paymentElementMountCurrency } : {}),
+      ...(paymentElementDirectListedCurrency
+        ? { payment_element_direct_listed_currency: paymentElementDirectListedCurrency }
+        : {}),
     },
     abortSignal,
   );
@@ -919,9 +1028,49 @@ export const reduceCheckoutState = produce((state: State, action: Action) => {
         ("state" in action && action.state !== state.state && state.country === "CA") ||
         ("vatId" in action && action.vatId !== state.vatId) ||
         ("gift" in action && action.gift?.type !== state.gift?.type) ||
+        ("buyerCurrency" in action && action.buyerCurrency !== state.buyerCurrency) ||
+        ("usingSavedCard" in action && action.usingSavedCard !== state.usingSavedCard) ||
         "products" in action ||
         "tip" in action
       ) {
+        // Hold the quote a currency change replaces, so the summary can keep its shape while the
+        // new one is minted. A second change landing on top of an in-flight one keeps the snapshot
+        // already held: that one is the last quote the buyer actually saw. Every other
+        // invalidation edits the cart itself, which makes the old amounts wrong rather than stale.
+        if ("buyerCurrency" in action) {
+          if (state.surcharges.type === "loaded")
+            state.buyerCurrencyRemint = { surcharges: state.surcharges.result, previousCurrency: state.buyerCurrency };
+          else if (state.buyerCurrencyRemint?.surfaceSwitch)
+            // An explicit pick landing on top of a surface switch's in-flight remint: there is no
+            // loaded quote to snapshot, but the held amounts still describe what the buyer saw.
+            // Keep them and re-point the remint at this pick, so a refusal restores the selection
+            // this pick replaced instead of skipping refusal/restore entirely.
+            state.buyerCurrencyRemint = {
+              ...state.buyerCurrencyRemint,
+              previousCurrency: state.buyerCurrency,
+              surfaceSwitch: false,
+            };
+        } else if ("usingSavedCard" in action) {
+          // Switching surface re-asks the server which currencies it can charge, but it does not
+          // touch the cart, so the loaded amounts are still the amounts. Hold them for the same
+          // reason a currency change does: folding the Total row (and the picker under it) away
+          // for the length of the round trip reads as a hang. Pay stays disabled until the
+          // replacement lands — isSubmitDisabled reads `surcharges`, not this snapshot.
+          if (state.surcharges.type === "loaded")
+            state.buyerCurrencyRemint = {
+              surcharges: state.surcharges.result,
+              previousCurrency: state.buyerCurrency,
+              surfaceSwitch: true,
+              // Pre-toggle: `action` is only merged into state further down.
+              previousUsingSavedCard: state.usingSavedCard,
+            };
+          state.unavailableBuyerCurrency = null;
+        } else {
+          state.buyerCurrencyRemint = null;
+          // The refusal was about the cart being replaced here, so it no longer describes
+          // anything. The next response says whether the new cart can be quoted in that currency.
+          state.unavailableBuyerCurrency = null;
+        }
         if (state.surcharges.type === "loading") state.surcharges.abort();
         state.surcharges = { type: "pending" };
         // The totals (and the buyer-currency quote token) the in-progress payment was built on
@@ -952,6 +1101,11 @@ export const reduceCheckoutState = produce((state: State, action: Action) => {
         state.emailTypoSuggestion = null;
       }
       Object.assign(state, action);
+      if ("buyerCurrency" in action) {
+        // Picking again retires the notice about the last refusal.
+        state.unavailableBuyerCurrency = null;
+        writeBuyerCurrencyPreference(state.buyerCurrency);
+      }
       break;
     case "set-wallet-billing-address": {
       // The wallet (Apple Pay / Google Pay) sheet shares its billing address only after the
@@ -960,7 +1114,7 @@ export const reduceCheckoutState = produce((state: State, action: Action) => {
       // "set-value" edits would (the server derives the taxable location from these fields),
       // but it must NOT cancel the in-flight payment back to "input": the wallet lanes hold
       // the already-tokenized payment and resume it once the quote reloads — but only if the
-      // recalculated total still matches the one the buyer approved on the sheet (see
+      // recalculated total still matches what the wallet sheet showed the buyer (see
       // resolveHeldWalletPayment). Cancelling here would abort that held payment before the
       // hold is even registered, dropping every wallet payment whose billing address changes
       // the tax location. A plain "set-value" can't express this, because on the element
@@ -975,6 +1129,8 @@ export const reduceCheckoutState = produce((state: State, action: Action) => {
         (country === "US" && zipCode !== state.zipCode) ||
         (country === "CA" && billingState !== state.state)
       ) {
+        state.buyerCurrencyRemint = null;
+        state.unavailableBuyerCurrency = null;
         if (state.surcharges.type === "loading") state.surcharges.abort();
         state.surcharges = { type: "pending" };
       }
@@ -982,6 +1138,28 @@ export const reduceCheckoutState = produce((state: State, action: Action) => {
         for (const key of ["country", "zipCode", "state"]) state.status.errors.delete(key);
       }
       Object.assign(state, { country, zipCode, state: billingState });
+      break;
+    }
+    case "set-paypal-billing-address": {
+      const { fullName, email } = action;
+      const billingAddress = paypalBillingAddressForCheckout(action, state);
+      const taxLocationChanged = paypalBillingAddressChangesTaxLocation(action, state);
+      if (taxLocationChanged) {
+        state.buyerCurrencyRemint = null;
+        state.unavailableBuyerCurrency = null;
+        if (state.surcharges.type === "loading") state.surcharges.abort();
+        state.surcharges = { type: "pending" };
+        state.resumeSubmitAfterCheckoutPayment = false;
+        if (state.status.type !== "finished") state.status = { type: "input", errors: new Set() };
+        state.warning =
+          "PayPal updated your tax location. Review the updated total below, then click PayPal again to continue.";
+      } else {
+        state.warning = null;
+      }
+      if (state.status.type === "input") {
+        for (const key of ["country", "zipCode", "state", "fullName", "email"]) state.status.errors.delete(key);
+      }
+      Object.assign(state, { ...billingAddress, fullName, ...(email ? { email } : {}) });
       break;
     }
     case "set-custom-field":
@@ -1122,6 +1300,8 @@ export const reduceCheckoutState = produce((state: State, action: Action) => {
     }
     case "update-products":
       state.products = action.products;
+      state.buyerCurrencyRemint = null;
+      state.unavailableBuyerCurrency = null;
       if (state.surcharges.type === "loading") state.surcharges.abort();
       state.surcharges = action.surcharges ? { type: "loaded", result: action.surcharges } : { type: "pending" };
       // Accepting a cross-sell updates the products mid-pipeline on purpose, and it always
@@ -1185,7 +1365,43 @@ export const reduceCheckoutState = produce((state: State, action: Action) => {
       // from a passive effect only updates after React flushes effects, leaving a window
       // where a stale response still saw the old value.
       if (state.surcharges.type !== "loading" || state.surcharges.requestId !== action.requestId) return;
-      state.surcharges = { type: "loaded", result: action.result };
+      {
+        const remint = state.buyerCurrencyRemint;
+        state.buyerCurrencyRemint = null;
+        state.surcharges = { type: "loaded", result: action.result };
+        // The notice deliberately does NOT clear just because the menu lists that currency again.
+        // The menu is built from settlement eligibility and only drops the currency the request
+        // in hand tried, so the response that restores the previous selection lists the refused
+        // one right back — clearing on it would erase the explanation a moment after showing it.
+        // Only the buyer picking again, or a cart edit, retires the notice.
+        // The buyer picked a currency and the response came back without it: this cart cannot be
+        // quoted in it. Put the selection back where it was and record the refusal — moving the
+        // buyer on to some third currency with no explanation is what must not happen.
+        if (
+          remint &&
+          !remint.surfaceSwitch &&
+          state.buyerCurrency != null &&
+          offersBuyerCurrency(action.result, state.buyerCurrency) === false
+        ) {
+          state.unavailableBuyerCurrency = state.buyerCurrency;
+          state.buyerCurrency = remint.previousCurrency;
+          writeBuyerCurrencyPreference(state.buyerCurrency);
+          // The response in hand is the canonical-USD fallback the refused currency produced, so
+          // the restored selection needs quoting again — but only when this same response says it
+          // is still on offer. Asking again for a currency the server has just withdrawn would
+          // refuse, restore, and ask again without end (a transient FX error withdraws every
+          // currency, so the buyer's previous one can be gone too).
+          const restored = state.buyerCurrency ?? action.result.detected_buyer_currency ?? null;
+          if (
+            restored != null &&
+            restored !== (action.result.buyer_currency_quote?.currency ?? "usd") &&
+            offersBuyerCurrency(action.result, restored)
+          ) {
+            state.buyerCurrencyRemint = remint;
+            state.surcharges = { type: "pending" };
+          }
+        }
+      }
       // A quote arriving is the other half of what a refused submit is waiting for. Accepting an
       // offer edits the cart, and a cart edit resets the quote to pending, so the refreshed payment
       // configuration usually lands while the quote is still in flight — this is where the resume
@@ -1197,6 +1413,17 @@ export const reduceCheckoutState = produce((state: State, action: Action) => {
       // "error". A stale failure must not surface a bogus alert or strand the checkout while
       // a fresher request is still loading.
       if (state.surcharges.type !== "loading" || state.surcharges.requestId !== action.requestId) return;
+      // A currency the buyer chose whose quote never arrived. Put the selection back on the
+      // currency the summary is still showing, so the picker and the amounts under it agree while
+      // the "something went wrong" alert explains the rest. The snapshot stays: it is the last
+      // quote the buyer saw, and it is the one they are being returned to.
+      //
+      // `unavailableBuyerCurrency` is deliberately NOT set: a request that never completed is not
+      // the server saying it cannot charge that currency, and the notice must not claim it did.
+      if (state.buyerCurrencyRemint && !state.buyerCurrencyRemint.surfaceSwitch) {
+        state.buyerCurrency = state.buyerCurrencyRemint.previousCurrency;
+        writeBuyerCurrencyPreference(state.buyerCurrency);
+      }
       state.surcharges = { type: "error" };
       break;
   }
@@ -1247,6 +1474,9 @@ export function createReducer(initial: {
       state: initial.state ?? "",
       email: url.searchParams.get("email") ?? initial.email,
       zipCode: initial.address?.zip ?? "",
+      buyerCurrency: readBuyerCurrencyPreference(),
+      buyerCurrencyRemint: null,
+      unavailableBuyerCurrency: null,
       customFieldValues,
       surcharges: { type: "pending" },
       saveAddress: !!initial.address,

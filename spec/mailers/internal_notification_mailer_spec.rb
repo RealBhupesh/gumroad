@@ -4,32 +4,28 @@ require "spec_helper"
 
 describe InternalNotificationMailer do
   describe "#notify" do
-    # Use the "risk" room, which maps to INTERNAL_NOTIFICATION_EMAIL — a recipient
-    # that is intentionally distinct from INTERNAL_NOTIFICATION_ALWAYS_CC. This keeps
-    # the `to` and `cc` assertions below meaningful even if PAYMENTS_NOTIFICATION_EMAIL
-    # and the always-CC address ever resolve to the same value in a shared config.
+    # Payments is finance@, always-CC is gumclaw@ — distinct, so To vs Cc is meaningful.
+    # Risk/ops rooms now also default to gumclaw (never hi@), so they cannot be used
+    # to assert a distinct CC.
     subject(:mail) do
       described_class.notify(
-        room_name: "risk",
+        room_name: "payments",
         sender: "VAT Reporting",
         message_text: "VAT report generated successfully."
       )
     end
 
     it "sends to the configured email for the room" do
-      expect(mail.to).to eq([INTERNAL_NOTIFICATION_EMAIL])
+      expect(mail.to).to eq([PAYMENTS_NOTIFICATION_EMAIL])
     end
 
     it "CCs Gumclaw on every notification in addition to the room recipient" do
-      # The mailer dedups the CC when it equals the room's own recipient, so this
-      # assertion is only meaningful while the two addresses are distinct. Assert the
-      # prerequisite explicitly rather than relying on it implicitly.
       expect(INTERNAL_NOTIFICATION_ALWAYS_CC).not_to eq(mail.to.first)
       expect(mail.cc).to eq([INTERNAL_NOTIFICATION_ALWAYS_CC])
     end
 
     it "sets the subject with room name and sender" do
-      expect(mail.subject).to eq("[test] [risk] VAT Reporting")
+      expect(mail.subject).to eq("[test] [payments] VAT Reporting")
     end
 
     it "includes the sender and message in the body" do
@@ -50,6 +46,55 @@ describe InternalNotificationMailer do
       it "includes attachment content in the body" do
         expect(mail.body.encoded).to include("Summary data")
         expect(mail.body.encoded).to include("Details here")
+      end
+    end
+
+    context "for the agent_reports room" do
+      subject(:mail) do
+        described_class.notify(
+          room_name: "agent_reports",
+          sender: "Blocked established buyers",
+          message_text: "report"
+        )
+      end
+
+      # Agent-only inbox. Risk/ops also go to gumclaw now (never hi@), so the
+      # regression to watch is leaking to finance@ or hi@.
+      it "delivers to the agent inbox only" do
+        expect(mail.to).to eq([INTERNAL_NOTIFICATION_ALWAYS_CC])
+        expect(mail.to).not_to include(PAYMENTS_NOTIFICATION_EMAIL)
+        expect(mail.to).not_to include("hi@gumroad.com")
+        expect(mail.cc).to be_nil
+      end
+    end
+
+    context "with S3 file attachments" do
+      subject(:mail) do
+        described_class.notify(
+          room_name: "risk",
+          sender: "India Sales Reporting",
+          message_text: "Report ready",
+          s3_attachments: [{ "bucket" => "gumroad-reporting", "key" => "sales-tax/in.csv", "filename" => "in.csv" }]
+        )
+      end
+
+      it "attaches the CSV downloaded from S3" do
+        s3_object = double("s3_object")
+        allow(Aws::S3::Resource).to receive_message_chain(:new, :bucket, :object).and_return(s3_object)
+        allow(s3_object).to receive(:content_length).and_return(20)
+        allow(s3_object).to receive_message_chain(:get, :body, :read).and_return("id,amount\n1,100\n")
+
+        expect(mail.attachments["in.csv"]).to be_present
+        expect(mail.attachments["in.csv"].body.decoded).to eq("id,amount\n1,100\n")
+      end
+
+      it "skips attaching a CSV larger than the MIME cap" do
+        s3_object = double("s3_object")
+        allow(Aws::S3::Resource).to receive_message_chain(:new, :bucket, :object).and_return(s3_object)
+        allow(s3_object).to receive(:content_length).and_return(described_class::MAX_S3_ATTACHMENT_BYTES + 1)
+
+        expect(s3_object).not_to receive(:get)
+        expect(mail.attachments).to be_empty
       end
     end
 

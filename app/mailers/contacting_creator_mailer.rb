@@ -120,7 +120,7 @@ class ContactingCreatorMailer < ApplicationMailer
                 purchase_dispute_evidence_url(
                   @disputable.purchase_for_dispute_evidence.secure_external_id(
                     scope: Purchases::DisputeEvidenceController::SECURE_ID_SCOPE,
-                    expires_at: dispute_evidence.seller_response_due_at
+                    expires_at: dispute_evidence.evidence_link_expires_at
                   )
                 ),
                 class: "button primary"
@@ -461,6 +461,10 @@ class ContactingCreatorMailer < ApplicationMailer
   def chargeback_lost_no_refund_policy(dispute_id)
     dispute = Dispute.find(dispute_id)
     @disputable = dispute.disputable
+    # Mailer jobs can render after product refund policies change.
+    @product_without_refund_policy = @disputable.first_product_without_refund_policy
+    return do_not_send if @product_without_refund_policy.nil?
+
     @seller = @disputable.seller
     @subject = "A dispute has been lost"
   end
@@ -715,9 +719,9 @@ class ContactingCreatorMailer < ApplicationMailer
     @review_notification_claim = @review.claim_seller_notification
     return do_not_send if @review_notification_claim.nil?
 
-    full_name = @review.purchase.full_name
+    name = @review.purchase.rater_identity_name
     email = @review.purchase.email
-    @buyer = full_name.present? ? "#{full_name} (#{email})" : email
+    @buyer = name.present? ? "#{name} (#{email})" : email
     @subject = "#{@buyer} reviewed #{@product.name}"
   end
 

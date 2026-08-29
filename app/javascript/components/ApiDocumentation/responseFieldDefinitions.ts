@@ -540,7 +540,7 @@ export const SUBSCRIBER_FIELDS: FieldDefinition[] = [
     name: "status",
     type: "string",
     description:
-      'Subscription status: "alive", "pending_cancellation", "pending_failure", "failed_payment", "fixed_subscription_period_ended", or "cancelled"',
+      'Subscription status: "alive", "payment_method_update_required", "pending_cancellation", "pending_failure", "failed_payment", "fixed_subscription_period_ended", or "cancelled"',
   },
 ];
 
@@ -832,6 +832,35 @@ export const WORKFLOW_EMAIL_FIELDS: FieldDefinition[] = [
   { name: "created_at", type: "string", description: "ISO 8601 timestamp of when the email was created" },
   { name: "updated_at", type: "string", description: "ISO 8601 timestamp of when the email was last updated" },
 ];
+
+export const WORKFLOW_EMAIL_WRITE_FIELDS: FieldDefinition[] = WORKFLOW_EMAIL_FIELDS.map((field) => {
+  switch (field.name) {
+    case "open_count":
+      return {
+        ...field,
+        type: "number | null",
+        description: "Number of unique opens for this step; null because write responses do not compute analytics",
+      };
+    case "open_rate":
+      return {
+        ...field,
+        description: "Unique open rate; null because write responses do not compute analytics",
+      };
+    case "click_count":
+      return {
+        ...field,
+        type: "number | null",
+        description: "Number of unique clicks for this step; null because write responses do not compute analytics",
+      };
+    case "click_rate":
+      return {
+        ...field,
+        description: "Unique click rate; null because write responses do not compute analytics",
+      };
+    default:
+      return field;
+  }
+});
 
 export const WORKFLOW_FIELDS: FieldDefinition[] = [
   { name: "id", type: "string", description: "Unique identifier for the workflow" },

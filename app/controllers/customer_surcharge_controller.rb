@@ -19,6 +19,7 @@ class CustomerSurchargeController < ApplicationController
     tax_included_rate = 0
     subtotal = 0
     quote_line_items = []
+    rates_by_listed_currency = {}
     # A buyer-currency quote needs a canonical money breakdown for every line the browser
     # will display; if any request line can't produce one (unknown product, missing
     # subscription), the quote is withheld and the cart falls back to canonical USD.
@@ -29,11 +30,20 @@ class CustomerSurchargeController < ApplicationController
         all_lines_quotable = false
         next
       end
-      surcharges = calculate_surcharges(product, item[:quantity], item[:price].to_d.to_i, subscription_id: item[:subscription_id], recommended_by: item[:recommended_by])
+      listed_currency = product.price_currency_type.to_s.downcase
+      surcharges = calculate_surcharges(
+        product,
+        item[:quantity],
+        item[:price].to_d.to_i,
+        subscription_id: item[:subscription_id],
+        recommended_by: item[:recommended_by],
+        rate: rates_by_listed_currency.fetch(listed_currency, :unset)
+      )
       unless surcharges
         all_lines_quotable = false
         next
       end
+      rates_by_listed_currency[listed_currency] = surcharges[:rate]
       tax_result = surcharges[:sales_tax_result]
       vat_id_valid = tax_result.business_vat_status == :valid
       has_vat_id_input ||= tax_result.to_hash[:has_vat_id_input]
@@ -63,8 +73,54 @@ class CustomerSurchargeController < ApplicationController
         charge_shipping_usd_cents: charge_details[:surcharges] ? charge_details[:surcharges].fetch(:shipping_rate) : 0,
         charge_now: charge_details[:charge_now],
         later_charge_kind: charge_details[:kind],
-        later_charge_price_cents: charge_details[:later_price_cents]
+        later_charge_price_cents: charge_details[:later_price_cents],
+        # The rate `calculate_surcharges` used a moment earlier to convert this line's
+        # shipping to canonical USD cents — not a fresh `get_rate` call (gumroad-private#1958,
+        # Greptile review on #7149: a second independent read here can straddle a rate
+        # refresh and disagree with the first one even within a single request).
+        listed_currency_rate: surcharges[:rate]
       )
+    end
+
+    detected_buyer_currency = buyer_currency_for_ip(request.remote_ip)
+    requested_buyer_currency = Checkout::BuyerCurrencyQuote.normalize_requested_currency(params[:buyer_currency])
+    quote_currency = requested_buyer_currency || detected_buyer_currency
+    direct_listed_selector_currency = direct_listed_selector_currency_for_cart(
+      all_lines_quotable ? quote_line_items : []
+    )
+    # Client-confirm can switch only between canonical USD and this listed currency. Normalize a
+    # stale preference before quote creation so this surface never returns an unusable FX token.
+    if direct_listed_selector_currency.present? &&
+       ![Currency::USD, direct_listed_selector_currency].include?(quote_currency)
+      quote_currency = direct_listed_selector_currency
+    end
+    quote_props = buyer_currency_quote_props(
+      line_items: all_lines_quotable ? quote_line_items : nil,
+      # Sum the per-line integers: rounding the running totals once can disagree
+      # with charge-time line totals, and a quote that does not reconcile is refused.
+      canonical_total_cents: quote_line_items.sum(&:canonical_total_cents),
+      currency: quote_currency
+    )
+    # create() refuses a mixed/unquotable cart. Advertising those currencies would
+    # let the picker claim a presentment the charge will never honor. `cart_quotable?` asks the
+    # quote service the same question for the gates that hold in every currency (zero total,
+    # more sellers than it will quote, a mixed recurring cart, ...), so a cart no currency can
+    # get past offers US dollars alone rather than a menu whose entries disappear one by one as
+    # the buyer tries them.
+    quotable_cart = all_lines_quotable && Checkout::BuyerCurrencyQuote.cart_quotable?(
+      line_items: quote_line_items,
+      canonical_total_cents: quote_line_items.sum(&:canonical_total_cents)
+    )
+    available = available_buyer_currencies(quotable_cart ? quote_line_items : [])
+    if direct_listed_selector_currency.present?
+      available = available.select { [Currency::USD, direct_listed_selector_currency].include?(_1[:code]) }
+    end
+    # What is left can still fail for a reason specific to one currency (a settlement mismatch
+    # on the seller's account, or a cart uniformly listed in it). Don't advertise the one we just
+    # attempted to quote; the checkout tells the buyer their choice was refused.
+    if quote_currency.present? && quote_currency != Currency::USD && quote_props.nil? &&
+       !direct_listed_currency_offered_for_cart?(quote_line_items, quote_currency)
+      available = available.reject { |entry| entry[:code] == quote_currency }
     end
 
     render json: {
@@ -77,26 +133,21 @@ class CustomerSurchargeController < ApplicationController
       # Unlike the agreement total above, this includes only the tax due on an installment's
       # first payment. Payment surfaces must use the amount the charge path will create now.
       charge_canonical_total_cents: all_lines_quotable ? quote_line_items.sum(&:charge_canonical_total_cents) : nil,
-      buyer_currency_quote: buyer_currency_quote_props(
-        line_items: all_lines_quotable ? quote_line_items : nil,
-        # Sum the per-line integer totals rather than rounding the fractional running
-        # totals once: two lines with fractional taxes (0.4 + 0.4) round to 0 per line
-        # but 1 when summed first, and a quote whose lines don't reconcile to its total
-        # is refused. The per-line integers are also what the purchases carry at charge
-        # time, so this is the total the quote verification will see.
-        canonical_total_cents: quote_line_items.sum(&:canonical_total_cents)
-      )
+      buyer_currency_quote: quote_props,
+      detected_buyer_currency:,
+      available_buyer_currencies: available
     }
   end
 
   private
-    def buyer_currency_quote_props(line_items:, canonical_total_cents:)
+    def buyer_currency_quote_props(line_items:, canonical_total_cents:, currency: nil)
       return if line_items.nil?
 
       quote = Checkout::BuyerCurrencyQuote.create(
         line_items:,
         canonical_total_cents: canonical_total_cents.round.to_i,
-        ip: request.remote_ip
+        ip: request.remote_ip,
+        currency:
       )
       return if quote.blank?
 
@@ -168,7 +219,8 @@ class CustomerSurchargeController < ApplicationController
         item[:quantity],
         charge_base_price_cents + charge_tip_cents,
         subscription_id: item[:subscription_id],
-        recommended_by: item[:recommended_by]
+        recommended_by: item[:recommended_by],
+        rate: surcharges[:rate]
       )
       return if charge_surcharges.blank?
 
@@ -181,7 +233,7 @@ class CustomerSurchargeController < ApplicationController
       }
     end
 
-    def calculate_surcharges(product, quantity, price, subscription_id: nil, recommended_by: nil)
+    def calculate_surcharges(product, quantity, price, subscription_id: nil, recommended_by: nil, rate: :unset)
       if subscription_id.present?
         subscription = Subscription.find_by_external_id(subscription_id)
         return nil unless subscription&.original_purchase.present?
@@ -208,9 +260,18 @@ class CustomerSurchargeController < ApplicationController
       # Pass the product's listed currency so each rate term is converted the same way the
       # charge path does in Purchase#calculate_shipping. Calling this with the USD default and
       # converting the summed listed cents afterward is not equivalent under rounding.
+      #
+      # Captured once (unless the caller already has a reading from an earlier call in this
+      # same request — see the `rate:` param) so it can also be bound into a buyer-currency
+      # quote token (gumroad-private#1958, Greptile review on #7149): a second independent
+      # `get_rate` read for the same currency can straddle an `UpdateCurrenciesWorker` cache
+      # refresh and disagree with an earlier one even within a single request.
+      rate = get_rate(product.price_currency_type) if rate == :unset
+      rate = nil if product.price_currency_type.to_s.downcase == Currency::USD
       shipping_rate = shipping_destination&.calculate_shipping_rate(
         quantity:,
-        currency_type: product.price_currency_type
+        currency_type: product.price_currency_type,
+        rate:
       ) || 0
 
       sales_tax_result = SalesTaxCalculator.new(product:,
@@ -221,6 +282,71 @@ class CustomerSurchargeController < ApplicationController
                                                 buyer_vat_id:,
                                                 from_discover:).calculate
 
-      { sales_tax_result:, shipping_rate: }
+      { sales_tax_result:, shipping_rate:, rate: }
+    end
+
+    def available_buyer_currencies(line_items)
+      products = line_items.filter_map(&:product).uniq
+      unless products.present? && products.all? { Checkout::BuyerCurrencyEligibility.seller_enabled?(_1.user) }
+        return [{ code: Currency::USD, label: CURRENCY_CHOICES.dig(Currency::USD, :display_format) || Currency::USD.upcase }]
+      end
+
+      codes = [Currency::USD] + CURRENCY_CHOICES.keys.map(&:to_s)
+      codes.uniq.filter_map do |code|
+        next unless currency_offered_for_cart?(line_items, code)
+
+        { code:, label: (CURRENCY_CHOICES.dig(code, :display_format) || code.upcase) }
+      end
+    end
+
+    def currency_offered_for_cart?(line_items, code)
+      # USD is the canonical charge currency every cart can settle in, so it is always
+      # offered; the gates below only decide which extra currencies join it.
+      return true if code == Currency::USD
+
+      return true if direct_listed_currency_offered_for_cart?(line_items, code)
+
+      # A charge entirely listed in this currency uses the direct-listed lane (or stays
+      # unquoted). A mixed charge instead quotes its canonical USD total, so its already-listed
+      # lines must not remove a currency that the remaining lines can settle. Grouped per
+      # seller inside the predicate, matching how the quote is minted and honored per charge.
+      return false unless Checkout::BuyerCurrencyQuote.buyer_currency_listing_quotable?(line_items:, buyer_currency: code)
+
+      line_items.all? do |line_item|
+        product = line_item.product
+        product.price_currency_type.to_s.downcase == code.to_s.downcase || currency_offered_for?(product, code)
+      end
+    end
+
+    def currency_offered_for?(product, code)
+      return true if code == Currency::USD
+      return false if product.blank?
+
+      buyer_currency_settleable?(
+        seller: product.user,
+        buyer_currency: code,
+        product:,
+        product_currency: product.price_currency_type
+      )
+    end
+
+    def direct_listed_currency_offered_for_cart?(line_items, code)
+      return false unless params[:payment_details_source] == PurchasePaymentFlow::PAYMENT_ELEMENT
+      reported_currencies = [
+        params[:payment_element_mount_currency],
+        params[:payment_element_direct_listed_currency],
+      ].filter_map { _1.to_s.downcase.presence }
+      return false unless reported_currencies.include?(code.to_s.downcase)
+
+      Checkout::BuyerCurrencyEligibility.direct_listed_line_items_eligible?(line_items:, buyer_currency: code)
+    end
+
+    def direct_listed_selector_currency_for_cart(line_items)
+      currency = params[:payment_element_direct_listed_currency].to_s.downcase.presence
+      return if currency.blank?
+
+      # This capability keeps the listed option available after the Element switches to USD.
+      # Prepare still validates the separately reported actual mount before creating an intent.
+      currency if direct_listed_currency_offered_for_cart?(line_items, currency)
     end
 end

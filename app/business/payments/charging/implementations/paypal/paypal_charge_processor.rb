@@ -559,69 +559,6 @@ class PaypalChargeProcessor
     purchase_unit_info
   end
 
-  def self.create_order_from_product_info(product_info)
-    product = Link.find_by_external_id(product_info[:external_id])
-    merchant_account = product.user.merchant_account(charge_processor_id)
-    currency = product_info[:currency_code]
-    item_name = sanitize_for_paypal(product.name, MAXIMUM_ITEM_NAME_LENGTH).presence ||
-        sanitize_for_paypal(product.general_permalink, MAXIMUM_ITEM_NAME_LENGTH)
-
-    purchase_unit_info = create_purchase_unit_info(permalink: product.unique_permalink,
-                                                   item_name:,
-                                                   currency: merchant_account.currency,
-                                                   merchant_id: merchant_account.charge_processor_merchant_id,
-                                                   descriptor: sanitize_for_paypal(product.statement_description, MAXIMUM_DESCRIPTOR_LENGTH),
-                                                   price_cents_usd: get_usd_cents(currency, product_info[:price_cents].to_i),
-                                                   shipping_cents_usd: get_usd_cents(currency, product_info[:shipping_cents].to_i),
-                                                   tax_cents_usd: get_usd_cents(currency,
-                                                                                product_info[:vat_cents].to_i > 0 ?
-                                                                                  product_info[:exclusive_vat_cents].to_i :
-                                                                                  product_info[:exclusive_tax_cents].to_i),
-                                                   fee_cents_usd: product.gumroad_amount_for_paypal_order(
-                                                     amount_cents: get_usd_cents(currency, product_info[:price_cents].to_i),
-                                                     affiliate_id: product_info[:affiliate_id],
-                                                     vat_cents: get_usd_cents(currency, product_info[:vat_cents].to_i),
-                                                     was_recommended: !!product_info[:was_recommended]),
-                                                   total_cents_usd: get_usd_cents(currency, product_info[:total_cents].to_i),
-                                                   quantity: product_info[:quantity].to_i)
-
-    create_order(purchase_unit_info)
-  end
-
-  def self.update_order_from_product_info(paypal_order_id, product_info)
-    if paypal_order_id.blank? || product_info.blank?
-      ErrorNotifier.notify("PayPal order ID or product info not present in update order request")
-      raise ChargeProcessorError, "PayPal order ID or product info not present in update order request"
-    end
-
-    product = Link.find_by_external_id(product_info[:external_id])
-    merchant_account = product.user.merchant_account(charge_processor_id)
-    currency = product_info[:currency_code]
-    item_name = sanitize_for_paypal(product.name, MAXIMUM_ITEM_NAME_LENGTH).presence ||
-        sanitize_for_paypal(product.general_permalink, MAXIMUM_ITEM_NAME_LENGTH)
-
-    purchase_unit_info = create_purchase_unit_info(permalink: product.unique_permalink,
-                                                   item_name:,
-                                                   currency: merchant_account.currency,
-                                                   merchant_id: merchant_account.charge_processor_merchant_id,
-                                                   descriptor: sanitize_for_paypal(product.statement_description, MAXIMUM_DESCRIPTOR_LENGTH),
-                                                   price_cents_usd: get_usd_cents(currency, product_info[:price_cents].to_i),
-                                                   shipping_cents_usd: get_usd_cents(currency, product_info[:shipping_cents].to_i),
-                                                   tax_cents_usd: get_usd_cents(currency,
-                                                                                product_info[:vat_cents].to_i > 0 ?
-                                                                                    product_info[:exclusive_vat_cents].to_i :
-                                                                                    product_info[:exclusive_tax_cents].to_i),
-                                                   fee_cents_usd: product.gumroad_amount_for_paypal_order(
-                                                     amount_cents: get_usd_cents(currency, product_info[:price_cents].to_i),
-                                                     affiliate_id: product_info[:affiliate_id],
-                                                     vat_cents: get_usd_cents(currency, product_info[:vat_cents].to_i),
-                                                     was_recommended: !!product_info[:was_recommended]),
-                                                   total_cents_usd: get_usd_cents(currency, product_info[:total_cents].to_i),
-                                                   quantity: product_info[:quantity].to_i)
-
-    update_order(paypal_order_id, purchase_unit_info)
-  end
-
   def self.create_order(purchase_unit_info)
     if purchase_unit_info.blank?
       ErrorNotifier.notify("Products are not present in create order request")
@@ -637,14 +574,6 @@ class PaypalChargeProcessor
       error_message = PaypalChargeProcessor.build_error_message("Failed PayPal create order: ", paypal_rejection_description(api_response))
       raise build_paypal_rejection(determine_create_order_error(api_response), error_message, api_response)
     end
-  end
-
-  def self.update_order(paypal_order_id, purchase_unit_info)
-    paypal_rest_api = PaypalRestApi.new
-    api_response = paypal_rest_api.update_order(order_id: paypal_order_id, purchase_unit_info:)
-
-    log_paypal_api_response("Update Order", nil, api_response)
-    paypal_rest_api.successful_response?(api_response)
   end
 
   def self.capture(order_id:, billing_agreement_id: nil)
@@ -700,13 +629,15 @@ class PaypalChargeProcessor
                            Charge.find_by_external_id(reference.sub(Charge::COMBINED_CHARGE_PREFIX, "")) :
                            Purchase.find_by_external_id(reference)
 
+    expected_purchase_unit_info = charge_or_purchase.is_a?(Charge) ?
+                                    self.class.paypal_order_info_from_charge(charge_or_purchase) :
+                                    self.class.paypal_order_info(charge_or_purchase)
+
     if chargeable.instance_of?(PaypalApprovedOrderChargeable)
       update_invoice_id(order_id: charge_or_purchase.paypal_order_id, invoice_id: reference)
-      capture_order(order_id: charge_or_purchase.paypal_order_id)
+      capture_order(order_id: charge_or_purchase.paypal_order_id, expected_purchase_unit_info:)
     else
-      paypal_order_id = charge_or_purchase.is_a?(Charge) ?
-                          self.class.create_order_from_charge(charge_or_purchase) :
-                          self.class.create_order_from_purchase(charge_or_purchase)
+      paypal_order_id = self.class.create_order(expected_purchase_unit_info)
       charge_or_purchase.update!(paypal_order_id:)
       charge_or_purchase.purchases.each { |purchase| purchase.update!(paypal_order_id:) } if charge_or_purchase.is_a?(Charge)
       capture_order(order_id: paypal_order_id, billing_agreement_id: chargeable.fingerprint)
@@ -724,13 +655,21 @@ class PaypalChargeProcessor
     end
   end
 
-  def capture_order(order_id:, billing_agreement_id: nil)
+  def capture_order(order_id:, billing_agreement_id: nil, expected_purchase_unit_info: nil)
     paypal_transaction = self.class.capture(order_id:, billing_agreement_id:)
     capture = paypal_transaction.purchase_units[0].payments.captures[0]
 
     if capture.status.downcase == PaypalApiPaymentStatus::COMPLETED.downcase ||
         (capture.status.downcase == PaypalApiPaymentStatus::PENDING.downcase &&
             capture.status_details.reason.upcase == "PENDING_REVIEW")
+      if expected_purchase_unit_info.present?
+        begin
+          ensure_captured_amount_matches!(capture, expected_purchase_unit_info)
+        rescue ChargeProcessorError => e
+          refund_mismatched_capture!(paypal_transaction, capture)
+          raise e
+        end
+      end
       charge = PaypalCharge.new(paypal_transaction_id: capture.id,
                                 order_api_used: true,
                                 payment_details: paypal_transaction)
@@ -747,6 +686,41 @@ class PaypalChargeProcessor
                                          "PayPal transaction failed with status #{capture.status}",
                                          charge_id: capture.id)
     end
+  end
+
+  def ensure_captured_amount_matches!(capture, expected_purchase_unit_info)
+    captured_amount = capture.amount
+    captured_currency = captured_amount&.currency_code
+    captured_value = captured_amount&.value
+    expected_currency = expected_purchase_unit_info[:currency].to_s.upcase
+
+    if captured_currency.blank? || captured_value.blank? || !captured_currency.casecmp?(expected_currency)
+      raise ChargeProcessorError, "PayPal captured amount does not match Gumroad order amount"
+    end
+
+    begin
+      captured_total = BigDecimal(captured_value.to_s)
+      expected_total = BigDecimal(expected_purchase_unit_info[:total].to_s)
+    rescue ArgumentError, TypeError
+      raise ChargeProcessorError, "PayPal captured amount does not match Gumroad order amount"
+    end
+
+    if captured_total != expected_total
+      raise ChargeProcessorError, "PayPal captured amount does not match Gumroad order amount"
+    end
+  end
+
+  # Reverses a capture that already settled with the wrong amount so the underpayment
+  # doesn't sit unreconciled — a mismatch here means real money moved before the check
+  # in ensure_captured_amount_matches! ran. Swallows refund failures so the original
+  # amount-mismatch error still surfaces to the caller; Sentry has the refund failure for follow-up.
+  def refund_mismatched_capture!(paypal_transaction, capture)
+    merchant_id = paypal_transaction.purchase_units[0].payee.merchant_id
+    refund!(capture.id,
+            merchant_account: MerchantAccount.find_by(charge_processor_merchant_id: merchant_id),
+            paypal_order_purchase_unit_refund: true)
+  rescue StandardError => e
+    ErrorNotifier.notify(e, capture_id: capture.id, reason: "mismatched_capture_refund_failed")
   end
 
   def refund!(charge_id, amount_cents: nil, merchant_account: nil, paypal_order_purchase_unit_refund: nil, purchase: nil, **_args)

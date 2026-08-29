@@ -2669,21 +2669,77 @@ class PurchaseTest < ActiveSupport::TestCase
   end
 
   # context "purchasing physical products"
-  test "not_double_charged purchasing physical products prohibits double-charges within 10 seconds" do
+  test "not_double_charged purchasing physical products that are quantity-enabled requires confirmation within 2 hours" do
     product = create_physical_product
+    assert product.quantity_enabled
     ip = unique_ip
-    create_physical_purchase(link: product, seller: product.user, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first], created_at: 8.seconds.ago)
+    create_physical_purchase(link: product, seller: product.user, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first], created_at: 90.minutes.ago)
     purchase2 = build_physical_purchase(link: product, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first])
     assert_not purchase2.valid?
+    assert_equal PurchaseErrorCode::DUPLICATE_PURCHASE_CONFIRMATION_REQUIRED, purchase2.error_code
     assert_equal ["You have already paid for this product. It has been emailed to you. Do you want to buy it again?"], purchase2.errors[:base]
   end
 
-  test "not_double_charged purchasing physical products allows double-charges after 10 seconds" do
+  test "not_double_charged purchasing physical products that are quantity-enabled allows a confirmed repeat within 2 hours" do
     product = create_physical_product
+    assert product.quantity_enabled
     ip = unique_ip
-    create_physical_purchase(link: product, seller: product.user, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first], created_at: 11.seconds.ago)
+    create_physical_purchase(link: product, seller: product.user, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first], created_at: 90.minutes.ago)
+    purchase2 = build_physical_purchase(link: product, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first])
+    purchase2.confirmed_duplicate_purchase = true
+    assert purchase2.valid?
+  end
+
+  test "not_double_charged purchasing physical products that are quantity-enabled requires confirmation just inside 2 hours" do
+    travel_to(Time.current)
+    product = create_physical_product
+    assert product.quantity_enabled
+    ip = unique_ip
+    create_physical_purchase(link: product, seller: product.user, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first], created_at: 119.minutes.ago)
+    purchase2 = build_physical_purchase(link: product, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first])
+    assert_not purchase2.valid?
+    assert_equal PurchaseErrorCode::DUPLICATE_PURCHASE_CONFIRMATION_REQUIRED, purchase2.error_code
+  end
+
+  test "not_double_charged purchasing physical products that are quantity-enabled allows double-charges after 2 hours" do
+    travel_to(Time.current)
+    product = create_physical_product
+    assert product.quantity_enabled
+    ip = unique_ip
+    create_physical_purchase(link: product, seller: product.user, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first], created_at: 121.minutes.ago)
     purchase2 = build_physical_purchase(link: product, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first])
     assert purchase2.valid?
+  end
+
+  test "not_double_charged purchasing physical products that are licensed requires confirmation within 2 hours" do
+    product = create_physical_product
+    product.update!(is_licensed: true)
+    assert product.is_physical
+    assert product.is_licensed
+    ip = unique_ip
+    create_physical_purchase(link: product, seller: product.user, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first], created_at: 90.minutes.ago)
+    purchase2 = build_physical_purchase(link: product, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first])
+    assert_not purchase2.valid?
+    assert_equal PurchaseErrorCode::DUPLICATE_PURCHASE_CONFIRMATION_REQUIRED, purchase2.error_code
+  end
+
+  test "not_double_charged upgrading a physical subscription allows the upgrade after 10 seconds" do
+    product = create_physical_product
+    ip = unique_ip
+    create_physical_purchase(link: product, seller: product.user, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first], created_at: 90.minutes.ago)
+    purchase2 = build_physical_purchase(link: product, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first])
+    purchase2.is_upgrade_purchase = true
+    assert purchase2.valid?
+  end
+
+  test "not_double_charged upgrading a physical subscription prohibits double-charges within 10 seconds" do
+    product = create_physical_product
+    ip = unique_ip
+    create_physical_purchase(link: product, seller: product.user, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first], created_at: 5.seconds.ago)
+    purchase2 = build_physical_purchase(link: product, ip_address: ip, email: "bob@gumroad.com", variant_attributes: [product.skus.is_default_sku.first])
+    purchase2.is_upgrade_purchase = true
+    assert_not purchase2.valid?
+    assert_equal PurchaseErrorCode::DUPLICATE_PURCHASE_CONFIRMATION_REQUIRED, purchase2.error_code
   end
 
   # context "purchasing licensed products"
@@ -6100,6 +6156,29 @@ class PurchaseTest < ActiveSupport::TestCase
     # No discount on the original purchase means renewals charge its full total, which is
     # the correct cap — unchanged from the pre-existing upgrade behavior.
     assert_equal 525, mandate_options[:payment_method_options][:card][:mandate_options][:amount]
+  end
+
+  test "#mandate_options_for_stripe maps the fixed recurrence interval for a restart purchase (not sporadic)" do
+    product = create_membership_product
+    subscription = create_subscription(link: product)
+    create_purchase(charge_processor_id: StripeChargeProcessor.charge_processor_id, link: product, purchase_state: "successful",
+                    card_country: "IN", subscription:, is_original_subscription_purchase: true,
+                    price_cents: 100, total_transaction_cents: 105, displayed_price_cents: 100)
+    # Card-update reauth is not the original purchase and not an upgrade. It reaches
+    # mandate creation through setup_future_charges (Subscription::UpdaterService).
+    restart_purchase = create_purchase(charge_processor_id: StripeChargeProcessor.charge_processor_id, link: product, purchase_state: "in_progress",
+                                       card_country: "IN", subscription:, is_original_subscription_purchase: false,
+                                       price_cents: 100, total_transaction_cents: 105, displayed_price_cents: 100)
+    restart_purchase.setup_future_charges = true
+    chargeable = mock("chargeable")
+    chargeable.stubs(:requires_mandate?).returns(true)
+    restart_purchase.stubs(:chargeable).returns(chargeable)
+    restart_purchase.stubs(:subscription_duration).returns("monthly")
+
+    mandate_options = restart_purchase.mandate_options_for_stripe
+
+    assert_equal "month", mandate_options[:payment_method_options][:card][:mandate_options][:interval]
+    assert_equal 1, mandate_options[:payment_method_options][:card][:mandate_options][:interval_count]
   end
 
   # ---- #is_an_async_off_session_charge_in_india? ----------------------------
