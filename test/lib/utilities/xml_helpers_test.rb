@@ -2,7 +2,6 @@
 
 require "test_helper"
 
-# Ported from spec/lib/utilities/xml_helpers_spec.rb (#5801).
 class XmlHelpersTest < ActiveSupport::TestCase
   test "gets the text of the element in simple xml" do
     xml_raw = %(<?xml version="1.0" encoding="utf-8"?><root><element>the text</element></root>)
