@@ -848,6 +848,33 @@ describe Payouts do
       expect(first.reload).to be_processing
       expect(second.reload).to be_processing
     end
+
+    it "marks only the supplied balances when an explicit batch is passed" do
+      allow(StripePayoutProcessor).to receive(:is_balance_payable).and_return(true)
+      allow(StripePayoutProcessor).to receive(:prepare_payment_and_set_amount) do |payment, claimed|
+        payment.currency = Currency::USD
+        payment.amount_cents = claimed.sum(&:holding_amount_cents)
+        []
+      end
+
+      first = user.balances.sole
+      second = create(:balance, user:, merchant_account:, date: payout_date, amount_cents: 50_00, holding_amount_cents: 50_00)
+      expect(first).to be_unpaid
+      expect(second).to be_unpaid
+
+      payment, payment_errors = described_class.create_payment(
+        payout_date.to_s,
+        PayoutProcessorType::STRIPE,
+        user,
+        payout_type: Payouts::PAYOUT_TYPE_INSTANT,
+        balances: [first]
+      )
+
+      expect(payment_errors).to eq([])
+      expect(payment.balances).to eq([first])
+      expect(first.reload).to be_processing
+      expect(second.reload).to be_unpaid
+    end
   end
 
   describe ".create_payments_for_balances_up_to_date_for_bank_account_types" do
