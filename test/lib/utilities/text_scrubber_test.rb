@@ -2,7 +2,6 @@
 
 require "test_helper"
 
-# Ported from spec/lib/utilities/text_scrubber_spec.rb (#5801).
 class TextScrubberTest < ActiveSupport::TestCase
   test "strips HTML tags and retains the spaces between paragraphs" do
     text = "  <h1>Hello world!</h1><p>I'm a \n\n text.<br>More text!</p>  "
