@@ -28,9 +28,20 @@ describe StampPdfForPurchaseJob do
       allow(PdfStampingService).to receive(:stamp_for_purchase!).and_raise(PdfStampingService::Error)
     end
 
-    it "logs and doesn't raise an error" do
+    it "logs and re-raises so Sidekiq retries the stamp" do
       expect(Rails.logger).to receive(:error).with(/Failed stamping for purchase #{purchase.id}:/)
-      expect { described_class.new.perform(purchase.id) }.not_to raise_error
+      expect { described_class.new.perform(purchase.id) }.to raise_error(PdfStampingService::Error)
+    end
+
+    it "clears the enqueue cache so the buyer can retry after a notify failure" do
+      cache_key = PdfStampingService.cache_key_for_purchase(purchase.id)
+      Rails.cache.write(cache_key, true, expires_in: 4.hours)
+
+      expect do
+        expect { described_class.new.perform(purchase.id, true) }.to raise_error(PdfStampingService::Error)
+      end.not_to have_enqueued_mail(CustomerMailer, :files_ready_for_download)
+
+      expect(Rails.cache.read(cache_key)).to be_nil
     end
   end
 
