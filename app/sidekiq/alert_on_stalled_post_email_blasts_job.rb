@@ -7,14 +7,17 @@
 # enqueue never reached Redis — while the seller's dashboard shows a plausible non-zero delivered
 # count, so the only detection channel was a seller who knew their own audience size writing in.
 # 11 blasts / ~1.6M undelivered emails accrued that way over ten days before anyone noticed.
-# (A hard-killed job itself is not the stranding mode: super_fetch resurrects it.)
+# A hard-killed job is not reliable to resurrect: super_fetch's cleanup_the_dead can retire a
+# process while its private queue still holds jobs, stranding them in no Sidekiq set
+# (gumroad-private#2352).
 #
 # Auto-resume is deliberately conservative: only DEAD/UNACCOUNTED blasts still inside
-# AUTO_RESUME_WINDOW, at most once per blast, and never a non-opener resend while UNACCOUNTED —
-# its dedupe set is written only after delivery, so a duplicate racing a live sender the
-# snapshots missed would double-deliver. Older blasts may be time-boxed sale announcements worse
-# delivered late than not at all, and a blast that stalls AGAIN after a resume has something
-# wrong this job cannot see — all of these stay a human call and are reported as HELD.
+# AUTO_RESUME_WINDOW (unless recipients are still owed), not more than once per STALL_THRESHOLD,
+# and never a non-opener resend while UNACCOUNTED — its dedupe set is written only after
+# delivery, so a duplicate racing a live sender the snapshots missed would double-deliver.
+# A blast that emailed inside STALL_THRESHOLD is treated as running even when Sidekiq::Workers
+# does not list it — otherwise a still-sending large blast burns the resume marker and is
+# never tried again after the real death (gumroad-private#2338).
 #
 # The exception is a blast whose sender handed every recipient over and then died before
 # stamping `completed_at` (gumroad-private#2250). Resuming that one cannot double-send, so it
@@ -44,6 +47,15 @@ class AlertOnStalledPostEmailBlastsJob
 
   # Rows the run acted on (or would have) are the audit trail; message_for never truncates them.
   AUDITED_ACTIONS = [:resumed, :resumed_to_complete, :would_resume, :would_complete, :skipped_reappeared].freeze
+
+  # Both the parent distributor and its slice jobs carry the blast id as args[0], so a
+  # mid-send split blast must be recognized as a live sender by the scans below or it would
+  # read as UNACCOUNTED and be auto-resumed into duplicate enqueues (gumroad-private#2353).
+  BLAST_SENDER_CLASSES = %w[SendPostBlastEmailsJob SendPostBlastEmailsSliceJob].freeze
+
+  def post_blast_sender?(klass)
+    klass.in?(BLAST_SENDER_CLASSES)
+  end
 
   def perform
     scan = scan_for_stalled_blasts
@@ -80,7 +92,7 @@ class AlertOnStalledPostEmailBlastsJob
 
       stalled = candidates.map do |blast|
         disposition =
-          if busy.include?(blast.id) then :running
+          if last_email_recent?(blast) || busy.include?(blast.id) then :running
           elsif queued.include?(blast.id) then :queued
           elsif retrying.include?(blast.id) then :retrying
           elsif @dead_entries.key?(blast.id) then :dead
@@ -124,7 +136,9 @@ class AlertOnStalledPostEmailBlastsJob
       # A DEAD entry proves its attempt chain ended; UNACCOUNTED can hide a live sender, and a
       # concurrent duplicate double-delivers a non-opener resend.
       return :held_non_opener if entry[:disposition] == :unaccounted && blast.to_non_openers?
-      return :held_past_window if blast.requested_at < AUTO_RESUME_WINDOW.ago
+      # Recipients still owed cannot double-send (SentPostEmail unique / per-blast sent set),
+      # so a late resume is the remaining delivery, not a time-boxed surprise.
+      return :held_past_window if blast.requested_at < AUTO_RESUME_WINDOW.ago && !recipients_still_owed?(blast)
       return :held_already_resumed if $redis.exists?(RedisKey.stalled_blast_auto_resumed(blast.id))
       return :would_resume unless live
       # Re-read the live sets at action time — the scan's snapshots are already stale by now.
@@ -137,6 +151,16 @@ class AlertOnStalledPostEmailBlastsJob
     # Three full Sidekiq scans per call, so memoize: `resolve_action` runs once per candidate and
     # the scan is bounded at MAX_CANDIDATES_SCANNED. One read per run is still "at action time" —
     # the point is that it is later than the dispositions taken in `scan_for_stalled_blasts`.
+    def last_email_recent?(blast)
+      emailed_at = blast.last_email_delivered_at
+      emailed_at.present? && emailed_at > STALL_THRESHOLD.ago
+    end
+
+    def recipients_still_owed?(blast)
+      pending = $redis.get(RedisKey.blast_pending_recipients(blast.id))
+      pending.present? && pending.to_i.positive?
+    end
+
     def sender_visible_now?(blast_id)
       @live_blast_ids ||= (busy_blast_ids + queued_blast_ids + retrying_blast_ids).to_set
       @live_blast_ids.include?(blast_id)
@@ -147,35 +171,43 @@ class AlertOnStalledPostEmailBlastsJob
       # Atomic NX claim, written before the resume: overlapping runs cannot both claim the same
       # blast, and a crash between claim and resume holds the blast for a human instead of risking
       # a second automated resume of a blast in an unknown state.
-      claimed = $redis.set(marker, Time.current.iso8601, nx: true, ex: LOOKBACK.to_i)
+      # TTL is the stall window, not the 14-day lookback: a resume that dies in minutes
+      # must be eligible again on the next scan instead of held for the rest of LOOKBACK.
+      claimed = $redis.set(marker, Time.current.iso8601, nx: true, ex: STALL_THRESHOLD.to_i)
       return false unless claimed
 
-      if entry[:disposition] == :dead
-        @dead_entries.fetch(blast.id).retry
-      else
-        SendPostBlastEmailsJob.perform_async(blast.id)
-      end
+      # `retry` would re-push the dead entry's own jid, and super_fetch counts orphan recoveries
+      # per jid: a blast its poison-pill guard already dead-set has no budget left, so that job is
+      # killed again before it delivers (gumroad-private#2338). Drop the entry only after the
+      # enqueue — losing it without a replacement leaves an UNACCOUNTED blast, which is never
+      # auto-resumed when it is a non-opener resend.
+      SendPostBlastEmailsJob.perform_async(blast.id)
+      @dead_entries.fetch(blast.id).delete if entry[:disposition] == :dead
       true
     end
 
     def dead_blast_entries
       entries = {}
-      Sidekiq::DeadSet.new.scan("SendPostBlastEmailsJob") do |job|
-        entries[job.args[0]] = job if job.klass == "SendPostBlastEmailsJob"
+      BLAST_SENDER_CLASSES.each do |klass|
+        Sidekiq::DeadSet.new.scan(klass) do |job|
+          entries[job.args[0]] = job if job.klass == klass
+        end
       end
       entries
     end
 
     def retrying_blast_ids
       ids = []
-      Sidekiq::RetrySet.new.scan("SendPostBlastEmailsJob") do |job|
-        ids << job.args[0] if job.klass == "SendPostBlastEmailsJob"
+      BLAST_SENDER_CLASSES.each do |klass|
+        Sidekiq::RetrySet.new.scan(klass) do |job|
+          ids << job.args[0] if job.klass == klass
+        end
       end
       ids
     end
 
     def queued_blast_ids
-      Sidekiq::Queue.new("default").filter_map { |job| job.args[0] if job.klass == "SendPostBlastEmailsJob" }
+      Sidekiq::Queue.new("default").filter_map { |job| job.args[0] if post_blast_sender?(job.klass) }
     end
 
     def busy_blast_ids
@@ -184,7 +216,7 @@ class AlertOnStalledPostEmailBlastsJob
         # Sidekiq 7 hands the payload back as a JSON string here, not a parsed hash.
         payload = work["payload"]
         payload = JSON.parse(payload) if payload.is_a?(String)
-        ids << payload["args"][0] if payload && payload["class"] == "SendPostBlastEmailsJob"
+        ids << payload["args"][0] if payload && post_blast_sender?(payload["class"])
       rescue JSON::ParserError
         next
       end
@@ -209,11 +241,15 @@ class AlertOnStalledPostEmailBlastsJob
         "RUNNING/QUEUED may just be a very large blast mid-pass. DEAD/UNACCOUNTED blasts requested " \
           "within #{AUTO_RESUME_WINDOW.inspect} are resumed automatically, once per blast " \
           "(gumroad-private#2106) — except UNACCOUNTED non-opener resends, which a concurrent " \
-          "duplicate sender would double-deliver. UNACCOUNTED usually means a lost enqueue or a " \
-          "post no longer sendable (super_fetch resurrects hard-killed jobs on its own). HELD " \
+          "duplicate sender would double-deliver. UNACCOUNTED usually means a lost enqueue, a " \
+          "post no longer sendable, or a job stranded in a retired process's private queue that " \
+          "no resurrection pass has reached — super_fetch does not reliably resurrect hard-killed " \
+          "jobs (gumroad-private#2352). HELD " \
           "rows need a human: confirm with the seller (time-boxed blasts may be worse late than " \
-          "never), then `job.retry` a DEAD entry or `SendPostBlastEmailsJob.perform_async(blast_id)` " \
-          "for an UNACCOUNTED one. A blast whose sender finished delivering but died before the " \
+          "never), then `SendPostBlastEmailsJob.perform_async(blast_id)` — for a DEAD row too. " \
+          "Never `job.retry` a dead blast: it reuses the jid super_fetch has already spent its " \
+          "orphan budget on, so it is killed again before it delivers (gumroad-private#2338). " \
+          "A blast whose sender finished delivering but died before the " \
           "completion stamp is resumed regardless of those limits — the resumed job has nothing " \
           "left to send and just stamps it (gumroad-private#2250). See gumroad-private#1750 for " \
           "a worked run.",

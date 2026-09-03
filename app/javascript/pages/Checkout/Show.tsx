@@ -25,11 +25,13 @@ import {
   getCheckoutBuyerCurrencyDisplay,
   getCheckoutListedCurrencyDisplay,
   getCheckoutBuyerCurrencyQuoteToken,
+  isRecurringUpiPaymentConfig,
 } from "$app/components/Checkout/buyerCurrencyDisplay";
 import {
   buildBuyerCurrencyQuoteRecoveryDeps,
   recoverFromInvalidBuyerCurrencyQuote as recoverBuyerCurrencyQuote,
   useLatestCartGetter,
+  withRefreshedOfferCodes,
 } from "$app/components/Checkout/buyerCurrencyQuoteRecovery";
 import {
   type CartItem,
@@ -55,6 +57,7 @@ import {
 import { CrossSellModal } from "$app/components/Checkout/CrossSellModal";
 import { computeInitialCheckout, type InitialCheckout } from "$app/components/Checkout/initialCheckout";
 import {
+  canDisplayBuyerCurrencyQuote,
   canUseStripePaymentElement,
   canUseStripePaymentElementClientConfirm,
   computeTip,
@@ -64,6 +67,7 @@ import {
   createReducer,
   getConfiguredDirectListedCurrency,
   getCustomFieldKey,
+  getLoadedDirectListedAmountToken,
   getSelectableDirectListedCurrency,
   getTotalPriceFromProducts,
   type Gift,
@@ -252,14 +256,18 @@ const CheckoutIndexPage = () => {
   const [state, dispatch] = reducer;
   const configuredDirectListedCurrency = getConfiguredDirectListedCurrency(state);
   const selectableDirectListedCurrency = getSelectableDirectListedCurrency(state);
-  const buyerCurrencyDisplay = configuredDirectListedCurrency
-    ? null
-    : getCheckoutBuyerCurrencyDisplay(state.surcharges.type === "loaded" ? state.surcharges.result : null, {
-        cartPermalinks: cartForm.data.cart.items.map((item) => item.product.permalink),
-        willSaveCard: state.willSaveCard,
-        paymentMethod: state.paymentMethod,
-        paymentElementType: state.paymentElementType,
-      });
+  // Recurring UPI mounts and charges the server-selected INR lane regardless of any quote
+  // (clientConfirmBuyerCurrencyPresentmentEnabled excludes it), so the quote must not be
+  // displayed — and, below, its token must not be submitted.
+  const recurringUpiRegistration = isRecurringUpiPaymentConfig(state.checkoutPayment);
+  const buyerCurrencyDisplay =
+    configuredDirectListedCurrency || recurringUpiRegistration || !canDisplayBuyerCurrencyQuote(state)
+      ? null
+      : getCheckoutBuyerCurrencyDisplay(state.surcharges.type === "loaded" ? state.surcharges.result : null, {
+          cartPermalinks: cartForm.data.cart.items.map((item) => item.product.permalink),
+          willSaveCard: state.willSaveCard,
+          paymentMethod: state.paymentMethod,
+        });
   // The direct-listed currency lane, for the large-tip confirmation below and for the tip
   // basis the order submits. Suppressed whenever the FX-quoted buyer-currency lane is displaying,
   // exactly as the checkout summary's precedence does (`buyerCurrencyDisplay ?? listedCurrency`):
@@ -435,6 +443,7 @@ const CheckoutIndexPage = () => {
       const renewalPrice = discountLimitedToFirstCycle ? item.price * item.quantity : price;
       return {
         permalink: item.product.permalink,
+        uid: getCartItemUid(item),
         name: item.product.name,
         creator: item.product.creator,
         requireShipping: item.product.require_shipping,
@@ -454,6 +463,7 @@ const CheckoutIndexPage = () => {
         // The server renders the recurring UPI Element from the selected listed amount before
         // discounts. Keep that basis stable when a limited discount changes only today's charge.
         listedPriceCents: item.price * item.quantity,
+        listedChargePriceCents: price,
         renewalPriceCents: item.recurrence ? Math.round(convertToUSD(item, renewalPrice)) : null,
         payInInstallments: item.pay_in_installments,
         installmentPlan: item.product.installment_plan
@@ -492,11 +502,11 @@ const CheckoutIndexPage = () => {
 
   // Recovers a checkout whose local-currency quote the server refused at charge time. The
   // reasoning lives with the helper in buyerCurrencyQuoteRecovery.ts.
-  function recoverFromInvalidBuyerCurrencyQuote(lineItems: CartPurchaseResult["lineItems"]) {
+  function recoverFromInvalidBuyerCurrencyQuote(lineItems: CartPurchaseResult["lineItems"], cart = getLatestCart()) {
     recoverBuyerCurrencyQuote({
       lineItems,
       ...buildBuyerCurrencyQuoteRecoveryDeps({
-        getLatestCart,
+        getLatestCart: () => cart,
         setCart: (cart) => cartForm.setData({ cart }),
         getProducts,
         dispatchUpdateProducts: (products) => dispatch({ type: "update-products", products }),
@@ -557,14 +567,15 @@ const CheckoutIndexPage = () => {
         },
         recaptchaResponse: state.status.recaptchaResponse ?? null,
         recaptchaChallengeFallback: state.status.challengeFallback ?? false,
-        buyerCurrencyQuote: configuredDirectListedCurrency
-          ? null
-          : getCheckoutBuyerCurrencyQuoteToken(state.surcharges.type === "loaded" ? state.surcharges.result : null, {
-              cartPermalinks: cartForm.data.cart.items.map((item) => item.product.permalink),
-              willSaveCard: state.willSaveCard,
-              paymentMethod: state.paymentMethod,
-              paymentElementType: state.paymentElementType,
-            }),
+        buyerCurrencyQuote:
+          configuredDirectListedCurrency || recurringUpiRegistration || !canDisplayBuyerCurrencyQuote(state)
+            ? null
+            : getCheckoutBuyerCurrencyQuoteToken(state.surcharges.type === "loaded" ? state.surcharges.result : null, {
+                cartPermalinks: cartForm.data.cart.items.map((item) => item.product.permalink),
+                willSaveCard: state.willSaveCard,
+                paymentMethod: state.paymentMethod,
+              }),
+        directListedAmountToken: getLoadedDirectListedAmountToken(state),
         lineItems: (() => {
           // Precompute each line's discounted price bases once so the tip can be allocated
           // across the whole cart in a single pass. The per-line tips must sum exactly to
@@ -690,7 +701,9 @@ const CheckoutIndexPage = () => {
       ) {
         showAlert(BUYER_CURRENCY_QUOTE_INVALID_MESSAGE, "warning");
         dispatch({ type: "cancel" });
-        recoverFromInvalidBuyerCurrencyQuote(result.lineItems);
+        const refreshedCart = withRefreshedOfferCodes(getLatestCart(), result.offerCodes);
+        cartForm.setData({ cart: refreshedCart });
+        recoverFromInvalidBuyerCurrencyQuote(result.lineItems, refreshedCart);
         return;
       }
 

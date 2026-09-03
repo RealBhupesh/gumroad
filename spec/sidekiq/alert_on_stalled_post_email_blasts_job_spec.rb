@@ -7,8 +7,11 @@ describe AlertOnStalledPostEmailBlastsJob do
 
   def stalled_blast(requested_hours_ago: 6, post: self.post, delivery_count: 0, started: true)
     requested_at = requested_hours_ago.hours.ago
-    create(:post_email_blast, post:, requested_at:, started_at: started ? requested_at + 1.minute : nil,
-                              completed_at: nil, delivery_count:)
+    started_at = started ? requested_at + 1.minute : nil
+    # Factory default last_email is 10 minutes ago (still-sending). A stalled fixture must
+    # look idle or last_email_recent? would classify every candidate as running.
+    create(:post_email_blast, post:, requested_at:, started_at:, completed_at: nil, delivery_count:,
+                              first_email_delivered_at: started_at, last_email_delivered_at: started_at)
   end
 
   def stub_sidekiq(dead: [], retrying: [], busy: [], queued: [])
@@ -39,7 +42,7 @@ describe AlertOnStalledPostEmailBlastsJob do
   end
 
   def fake_sidekiq_job(blast_id)
-    instance_double(Sidekiq::SortedEntry, klass: "SendPostBlastEmailsJob", args: [blast_id], retry: nil)
+    instance_double(Sidekiq::SortedEntry, klass: "SendPostBlastEmailsJob", args: [blast_id], retry: nil, delete: nil)
   end
 
   before do
@@ -128,15 +131,41 @@ describe AlertOnStalledPostEmailBlastsJob do
       before { Feature.activate(:auto_resume_stalled_post_blasts) }
       after { Feature.deactivate(:auto_resume_stalled_post_blasts) }
 
-      it "retries a DEAD blast inside the resume window and marks it resumed once" do
+      it "re-enqueues a DEAD blast inside the resume window and marks it resumed once" do
         blast = stalled_blast(requested_hours_ago: 6)
         stub_sidekiq(dead: [blast.id])
 
         described_class.new.perform
 
-        expect(@dead_jobs.fetch(blast.id)).to have_received(:retry)
+        expect(SendPostBlastEmailsJob).to have_received(:perform_async).with(blast.id)
+        expect(@dead_jobs.fetch(blast.id)).to have_received(:delete)
         expect($redis.exists?(RedisKey.stalled_blast_auto_resumed(blast.id))).to be(true)
         expect(InternalNotificationWorker).not_to have_received(:perform_async)
+      end
+
+      # `retry` re-pushes the dead entry's ORIGINAL jid, and super_fetch's poison-pill guard
+      # counts orphan recoveries per jid — a blast it already killed is killed again before it
+      # delivers anything, silently (gumroad-private#2338).
+      it "never re-pushes the dead entry's own jid, which super_fetch would kill again" do
+        blast = stalled_blast(requested_hours_ago: 6)
+        stub_sidekiq(dead: [blast.id])
+
+        described_class.new.perform
+
+        expect(@dead_jobs.fetch(blast.id)).not_to have_received(:retry)
+        expect(SendPostBlastEmailsJob).to have_received(:perform_async).with(blast.id)
+      end
+
+      # The reverse order can leave a blast with neither a dead entry nor a sender, and an
+      # UNACCOUNTED non-opener resend is held for a human indefinitely.
+      it "keeps the dead entry when the fresh enqueue fails" do
+        blast = stalled_blast(requested_hours_ago: 6)
+        stub_sidekiq(dead: [blast.id])
+        allow(SendPostBlastEmailsJob).to receive(:perform_async).and_raise(Redis::CannotConnectError)
+
+        expect { described_class.new.perform }.to raise_error(Redis::CannotConnectError)
+
+        expect(@dead_jobs.fetch(blast.id)).not_to have_received(:delete)
       end
 
       it "re-enqueues an UNACCOUNTED blast inside the resume window" do
@@ -155,7 +184,8 @@ describe AlertOnStalledPostEmailBlastsJob do
 
         described_class.new.perform
 
-        expect(@dead_jobs.fetch(blast.id)).not_to have_received(:retry)
+        expect(@dead_jobs.fetch(blast.id)).not_to have_received(:delete)
+        expect(SendPostBlastEmailsJob).not_to have_received(:perform_async)
         expect(InternalNotificationWorker).to have_received(:perform_async) do |_room, _subject, message|
           expect(message).to match(/blast #{blast.id}.*HELD \(past/)
         end
@@ -172,6 +202,55 @@ describe AlertOnStalledPostEmailBlastsJob do
         expect(InternalNotificationWorker).to have_received(:perform_async) do |_room, _subject, message|
           expect(message).to match(/blast #{blast.id}.*HELD \(already auto-resumed/)
         end
+      end
+
+      it "retries again after the resume marker expires" do
+        blast = stalled_blast(requested_hours_ago: 6)
+        stub_sidekiq
+
+        described_class.new.perform
+        expect(SendPostBlastEmailsJob).to have_received(:perform_async).with(blast.id).once
+
+        $redis.del(RedisKey.stalled_blast_auto_resumed(blast.id))
+        described_class.new.perform
+        expect(SendPostBlastEmailsJob).to have_received(:perform_async).with(blast.id).twice
+      end
+
+      it "expires the resume marker after the stall threshold, not the lookback" do
+        blast = stalled_blast(requested_hours_ago: 6)
+        stub_sidekiq
+        allow($redis).to receive(:set).and_call_original
+        expect($redis).to receive(:set).with(
+          RedisKey.stalled_blast_auto_resumed(blast.id),
+          anything,
+          hash_including(nx: true, ex: described_class::STALL_THRESHOLD.to_i)
+        ).and_call_original
+
+        described_class.new.perform
+      end
+
+      it "treats a blast that emailed inside the stall threshold as running even without a Sidekiq worker" do
+        blast = stalled_blast(requested_hours_ago: 6)
+        blast.update!(last_email_delivered_at: 30.minutes.ago)
+        stub_sidekiq
+
+        described_class.new.perform
+
+        expect(SendPostBlastEmailsJob).not_to have_received(:perform_async)
+        expect($redis.exists?(RedisKey.stalled_blast_auto_resumed(blast.id))).to be(false)
+        expect(InternalNotificationWorker).not_to have_received(:perform_async)
+      end
+
+      it "resumes a blast past the window when recipients are still owed" do
+        blast = stalled_blast(requested_hours_ago: 30)
+        $redis.set(RedisKey.blast_pending_recipients(blast.id), 12)
+        stub_sidekiq(dead: [blast.id])
+
+        described_class.new.perform
+
+        expect(SendPostBlastEmailsJob).to have_received(:perform_async).with(blast.id)
+        expect(@dead_jobs.fetch(blast.id)).to have_received(:delete)
+        expect(InternalNotificationWorker).not_to have_received(:perform_async)
       end
 
       it "holds the blast when a concurrent run wins the NX claim between the check and the resume" do
@@ -203,14 +282,15 @@ describe AlertOnStalledPostEmailBlastsJob do
         end
       end
 
-      it "still retries a DEAD non-opener resend, since its dead entry proves no sender is running" do
+      it "still resumes a DEAD non-opener resend, since its dead entry proves no sender is running" do
         blast = stalled_blast(requested_hours_ago: 6)
         blast.update!(recipient_filter: PostEmailBlast::RECIPIENT_FILTER_UNOPENED)
         stub_sidekiq(dead: [blast.id])
 
         described_class.new.perform
 
-        expect(@dead_jobs.fetch(blast.id)).to have_received(:retry)
+        expect(SendPostBlastEmailsJob).to have_received(:perform_async).with(blast.id)
+        expect(@dead_jobs.fetch(blast.id)).to have_received(:delete)
         expect(InternalNotificationWorker).not_to have_received(:perform_async)
       end
 
@@ -238,6 +318,37 @@ describe AlertOnStalledPostEmailBlastsJob do
         expect(SendPostBlastEmailsJob).not_to have_received(:perform_async)
         expect(InternalNotificationWorker).not_to have_received(:perform_async)
       end
+
+      it "does not resume a split blast while a slice job is still queued" do
+        blast = stalled_blast
+        queue = [instance_double(Sidekiq::JobRecord, klass: "SendPostBlastEmailsSliceJob", args: [blast.id, 0, 2, []])]
+        allow(Sidekiq::Queue).to receive(:new).with("default").and_return(queue)
+        dead_set = instance_double(Sidekiq::DeadSet)
+        allow(Sidekiq::DeadSet).to receive(:new).and_return(dead_set)
+        allow(dead_set).to receive(:scan)
+        retry_set = instance_double(Sidekiq::RetrySet)
+        allow(Sidekiq::RetrySet).to receive(:new).and_return(retry_set)
+        allow(retry_set).to receive(:scan)
+        workers = instance_double(Sidekiq::Workers)
+        allow(Sidekiq::Workers).to receive(:new).and_return(workers)
+        allow(workers).to receive(:each)
+
+        described_class.new.perform
+
+        expect(SendPostBlastEmailsJob).not_to have_received(:perform_async)
+        expect(InternalNotificationWorker).not_to have_received(:perform_async)
+      end
+
+      it "treats a slice job in the busy set as a live sender" do
+        blast = stalled_blast
+        workers = instance_double(Sidekiq::Workers)
+        allow(Sidekiq::Workers).to receive(:new).and_return(workers)
+        allow(workers).to receive(:each) do |&block|
+          block.call("pid", "tid", { "payload" => { "class" => "SendPostBlastEmailsSliceJob", "args" => [blast.id, 0, 2, [1, 2]] }.to_json })
+        end
+
+        expect(described_class.new.send(:busy_blast_ids)).to include(blast.id)
+      end
     end
 
     context "when the blast already finished delivering" do
@@ -256,7 +367,8 @@ describe AlertOnStalledPostEmailBlastsJob do
 
         described_class.new.perform
 
-        expect(@dead_jobs.fetch(blast.id)).to have_received(:retry)
+        expect(SendPostBlastEmailsJob).to have_received(:perform_async).with(blast.id)
+        expect(@dead_jobs.fetch(blast.id)).to have_received(:delete)
         expect(InternalNotificationWorker).not_to have_received(:perform_async)
       end
 
@@ -359,7 +471,7 @@ describe AlertOnStalledPostEmailBlastsJob do
 
         described_class.new.perform
 
-        expect(@dead_jobs.fetch(blast.id)).not_to have_received(:retry)
+        expect(@dead_jobs.fetch(blast.id)).not_to have_received(:delete)
         expect(SendPostBlastEmailsJob).not_to have_received(:perform_async)
         expect($redis.exists?(RedisKey.stalled_blast_auto_resumed(blast.id))).to be(false)
         expect(InternalNotificationWorker).to have_received(:perform_async) do |_room, _subject, message|

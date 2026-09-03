@@ -11,6 +11,7 @@ import {
   getCheckoutListedCurrencyAmounts,
   getCheckoutListedCurrencyDisplay,
   getCheckoutPresentmentAmounts,
+  getMatchingDirectListedAllocations,
   toBuyerCurrencyCents,
   toCanonicalCents,
 } from "$app/components/Checkout/buyerCurrencyDisplay";
@@ -39,7 +40,7 @@ const surcharges = (overrides: Partial<SurchargesResponse> = {}): SurchargesResp
   ...overrides,
 });
 
-const cartOptions = { cartPermalinks: ["prod"], paymentElementType: "card" };
+const cartOptions = { cartPermalinks: ["prod"] };
 
 describe("getCheckoutBuyerCurrencyDisplay", () => {
   it("uses the locked surcharge quote as the checkout display rate", () => {
@@ -81,18 +82,6 @@ describe("getCheckoutBuyerCurrencyDisplay", () => {
       getCheckoutBuyerCurrencyDisplay(surcharges(), { ...cartOptions, paymentMethod: "stripePaymentRequest" }),
     ).toBeNull();
     expect(getCheckoutBuyerCurrencyDisplay(surcharges(), { ...cartOptions, paymentMethod: "card" })).not.toBeNull();
-  });
-
-  it("does not use buyer-currency display when Apple Pay or Google Pay is selected in the Payment Element", () => {
-    expect(
-      getCheckoutBuyerCurrencyDisplay(surcharges(), { ...cartOptions, paymentElementType: "apple_pay" }),
-    ).toBeNull();
-    expect(
-      getCheckoutBuyerCurrencyDisplay(surcharges(), { ...cartOptions, paymentElementType: "google_pay" }),
-    ).toBeNull();
-    expect(
-      getCheckoutBuyerCurrencyDisplay(surcharges(), { ...cartOptions, paymentElementType: "card" }),
-    ).not.toBeNull();
   });
 
   it("does not use buyer-currency display when the allocation is missing or belongs to another cart", () => {
@@ -219,12 +208,6 @@ describe("getCheckoutBuyerCurrencyQuoteToken", () => {
     // A non-card method (PayPal) also charges canonically; sending the token with it would
     // make the charge fail closed on every attempt instead of completing in USD.
     expect(getCheckoutBuyerCurrencyQuoteToken(surcharges(), { ...cartOptions, paymentMethod: "paypal" })).toBeNull();
-    expect(
-      getCheckoutBuyerCurrencyQuoteToken(surcharges(), { ...cartOptions, paymentElementType: "apple_pay" }),
-    ).toBeNull();
-    expect(
-      getCheckoutBuyerCurrencyQuoteToken(surcharges(), { ...cartOptions, paymentElementType: "google_pay" }),
-    ).toBeNull();
     expect(getCheckoutBuyerCurrencyQuoteToken(surcharges({ buyer_currency_quote: null }), cartOptions)).toBeNull();
     expect(getCheckoutBuyerCurrencyQuoteToken(null, cartOptions)).toBeNull();
   });
@@ -234,9 +217,7 @@ describe("getCheckoutBuyerCurrencyQuoteToken", () => {
     if (response.buyer_currency_quote) delete response.buyer_currency_quote.line_allocations;
 
     expect(getCheckoutBuyerCurrencyQuoteToken(response, cartOptions)).toBeNull();
-    expect(
-      getCheckoutBuyerCurrencyQuoteToken(surcharges(), { cartPermalinks: ["other"], paymentElementType: "card" }),
-    ).toBeNull();
+    expect(getCheckoutBuyerCurrencyQuoteToken(surcharges(), { cartPermalinks: ["other"] })).toBeNull();
   });
 });
 
@@ -290,6 +271,7 @@ describe("getCheckoutListedCurrencyDisplay", () => {
     elements_options: {
       stripe_elements_mode: "payment",
       currency: "brl",
+      buyer_currency_presentment: false,
       presentment_amount_cents: 4_990,
       listed_currency_display: listedCurrencyDisplay,
       payment_method_types: ["card", "pix"],
@@ -336,8 +318,12 @@ describe("getCheckoutListedCurrencyDisplay", () => {
     expect(listed).toEqual({ currencyCode: "brl", rate: 5.45, subunitToUnit: 100 });
   });
 
-  it("falls back to USD for tip or shipping shapes excluded from the direct-listed card lane", () => {
-    expect(getCheckoutListedCurrencyDisplay(directListedCardPayment(), brlCartItems(), { hasTip: true })).toBeNull();
+  it("keeps tips on the direct-listed card lane but falls back for shipping", () => {
+    expect(getCheckoutListedCurrencyDisplay(directListedCardPayment(), brlCartItems(), { hasTip: true })).toEqual({
+      currencyCode: "brl",
+      rate: 5.45,
+      subunitToUnit: 100,
+    });
     expect(
       getCheckoutListedCurrencyDisplay(directListedCardPayment(), brlCartItems(), { hasShipping: true }),
     ).toBeNull();
@@ -509,6 +495,51 @@ describe("getCheckoutListedCurrencyAmounts", () => {
     if (!amounts) throw new Error("Expected listed-currency amounts");
     expect(amounts.taxIncludedCents).toBe(545);
     expect(amounts.totalCents).toBe(4_990);
+  });
+
+  it("sums the server's per-line tax instead of converting the USD aggregate", () => {
+    // Two 1c USD tax lines at rate 1.5: the charge rounds each line (2 + 2 = 4), while one
+    // conversion of the 2c aggregate rounds to 3. The summary has to show what is charged.
+    const cad = { currencyCode: "cad" as const, rate: 1.5, subunitToUnit: 100 };
+    const amounts = getCheckoutListedCurrencyAmounts(cad, {
+      lines: [
+        { priceCents: 1_000, discountCents: 0 },
+        { priceCents: 1_000, discountCents: 0 },
+      ],
+      tipCents: 0,
+      usdTaxCents: 2,
+      usdTaxIncludedCents: 0,
+      usdShippingCents: 0,
+      listedTaxCents: 4,
+      listedShippingCents: 0,
+    });
+
+    if (!amounts) throw new Error("Expected listed-currency amounts");
+    expect(amounts.taxCents).toBe(4);
+    expect(amounts.totalCents).toBe(2_004);
+  });
+
+  it("matches direct-listed allocations to the cart before their sums may be used", () => {
+    const allocation = (permalink: string) => ({
+      permalink,
+      price_cents: 1_000,
+      tip_cents: 0,
+      tax_cents: 2,
+      shipping_cents: 0,
+      total_cents: 1_002,
+    });
+    const allocations = [allocation("product-a"), allocation("product-b")];
+
+    expect(
+      getMatchingDirectListedAllocations({ direct_listed_line_allocations: allocations }, ["product-a", "product-b"]),
+    ).toEqual(allocations);
+    expect(
+      getMatchingDirectListedAllocations({ direct_listed_line_allocations: allocations }, ["product-b", "product-a"]),
+    ).toBeNull();
+    expect(
+      getMatchingDirectListedAllocations({ direct_listed_line_allocations: allocations }, ["product-a"]),
+    ).toBeNull();
+    expect(getMatchingDirectListedAllocations({ direct_listed_line_allocations: null }, ["product-a"])).toBeNull();
   });
 
   it("returns nothing when there is no listed-currency lane", () => {

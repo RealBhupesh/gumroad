@@ -28,27 +28,15 @@ class Purchase < ApplicationRecord
   GUMROAD_FIXED_FEE_CENTS = 50
   PROCESSOR_FEE_PER_THOUSAND = 29
   PROCESSOR_FIXED_FEE_CENTS = 30
-  # IOF is a Brazilian consumer tax on any transaction that involves foreign exchange, currently
-  # 3.5% of the transaction value. It applies whenever the Pix payment leaves Brazil, which is
-  # every Pix charge except one created directly on a Brazilian seller's own Stripe account.
-  #
-  # This constant is the RECOVERY half, and it is narrower than the tax itself: it is billed only
-  # when Gumroad actually bore the cost. On a charge created on a Gumroad-held account, Gumroad
-  # tells Stripe to bill the buyer exactly the price they agreed to
-  # (`amount_includes_iof=always`, see Order::PreparePaymentIntentService#pix_payment_method_options)
-  # and Stripe deducts the IOF from what settles to us — so the cost has to be charged back to the
-  # seller as a fee component, or it would silently come out of Gumroad's own margin instead (the
-  # decision on gumroad-private#1305 was that the seller absorbs it).
-  #
-  # On a direct charge to a seller's own connected account the money never passes through a
-  # Gumroad-held balance, so there is no Gumroad cost to recover and this fee is not billed —
-  # whether or not the tax itself applied. That makes this gate deliberately DIFFERENT from
-  # Order::PreparePaymentIntentService#pix_iof_applies?, which decides whether the tax exists at
-  # all (a border question, keyed on the account's country) rather than who paid it. See the
-  # comment on that method.
+  # Brazilian IOF (3.5%) on Pix that leaves Brazil. This constant is the RECOVERY fee, billed
+  # only when Gumroad absorbed the tax (Gumroad-held account, amount_includes_iof=always).
+  # Direct charge to a connected account: no Gumroad cost, so no fee — whether or not IOF
+  # applied. Different question from PreparePaymentIntentService#pix_iof_applies? (tax exists
+  # vs who paid it). Seller absorbs it.
   PIX_IOF_FEE_PER_THOUSAND = 35
 
   MAX_PRICE_RANGE = (-2_147_483_647..2_147_483_647)
+  BUYER_CURRENCY_QUOTE_ROUNDING_SLACK_CENTS = 5
 
   CHARGED_SUCCESS_STATES = %w[preorder_authorization_successful successful]
   NON_GIFT_SUCCESS_STATES = CHARGED_SUCCESS_STATES.dup.push("not_charged")
@@ -663,7 +651,7 @@ class Purchase < ApplicationRecord
                 :is_applying_plan_change, :setup_intent, :charge_intent, :setup_future_charges, :skip_preparing_for_charge,
                 :installment_plan, :authenticated_offer_code_buyer, :ip_location_inherited,
                 :submitted_pre_discount_price_cents, :once_per_cart_discount_allocation, :offer_code_cart_quantity,
-                :confirmed_duplicate_purchase
+                :buyer_currency_quote_canonical_components, :confirmed_duplicate_purchase
 
   delegate :email, :name, to: :seller, prefix: "seller"
   delegate :name, to: :link, prefix: "link", allow_nil: true
@@ -674,20 +662,10 @@ class Purchase < ApplicationRecord
   scope :successful, -> { where(purchase_state: "successful") }
   scope :test_successful, -> { where(purchase_state: "test_successful") }
   scope :in_progress, -> { where(purchase_state: "in_progress") }
-  # A payment that can still complete without the buyer returning to checkout, but hasn't
-  # settled yet. Two shapes reach this state: a payment the processor already confirmed and
-  # is clearing (e.g. an ACH bank debit, several business days), and a Pix payment where
-  # Stripe issued a QR code / copy-paste key the buyer can pay from their banking app for up
-  # to half an hour (Purchase::FinalizeConfirmedChargeService writes "requires_action" for
-  # that case). Both conditions matter: `stripe_status` is only ever written once Stripe has
-  # a live payment to report on, so an attempt the buyer dropped before reaching a payment
-  # method keeps it nil and is NOT settling. And a purchase must still be in_progress — once
-  # it reaches a terminal state (failed, successful), stripe_status remains set but the
-  # payment is no longer in flight.
-  #
-  # The Pix case is deliberately included: an outstanding QR key is exactly the window where
-  # a buyer could pay again by another method and end up paying twice, which is what the
-  # double-charge guards built on this scope exist to prevent.
+  # In-flight payment: ACH clearing, or a Pix QR still payable. stripe_status is set only
+  # once Stripe has a live payment, so a dropped attempt (nil) is not settling; a terminal
+  # purchase keeps stripe_status but is no longer in flight. Pix is included so double-charge
+  # guards catch a second payment while the QR is still live.
   scope :payment_settling, -> { in_progress.where.not(stripe_status: nil) }
   # Unconfirmed attempts hold a short lease; a processor status means the payment can still settle
   # after that lease expires.
@@ -756,19 +734,11 @@ class Purchase < ApplicationRecord
   }
   scope :paid, -> { successful.where("purchases.price_cents > 0").where("stripe_refunded is null OR stripe_refunded = 0") }
   scope :not_fully_refunded, -> { where("purchases.stripe_refunded IS NULL OR purchases.stripe_refunded = 0") }
-  # Purchase selection for the tax report jobs' sales leg. Pre-cutover purchases keep the
-  # historical exclusion of purchases fully refunded before the cutover (their netted amount
-  # would be zero, and dropping the row is how historical periods were filed). A purchase must
-  # stay in the report whenever any of its refunds is reported as its own refund-period row:
-  # post-cutover purchases always (they report gross amounts), and pre-cutover purchases that
-  # were fully refunded only on/after the cutover (they report amounts net of pre-cutover
-  # refunds, which is still positive — the post-cutover refund row is what offsets the rest).
-  # Dropping such a sale row would leave its refund row with nothing to subtract from,
-  # understating the period pair by the sale amount.
-  #
-  # The post-cutover refund test reuses Refund.effective (the same scope Refund.for_tax_period_reporting
-  # uses to build those refund rows), so a reversed-failure refund — which never gets a refund
-  # row — can't keep an otherwise fully-refunded sale in the report.
+  # Tax-report sales leg. Keep a sale whenever any of its refunds is reported as its own
+  # refund-period row (post-cutover always; pre-cutover only if fully refunded on/after
+  # cutover — net of pre-cutover refunds is still positive). Dropping the sale understates
+  # the period pair. Pre-cutover fully-refunded-before-cutover stays excluded (netted to 0).
+  # Uses Refund.effective so a reversed-failure refund cannot keep the sale in.
   # See Purchase::Reportable::REFUND_REPORTING_CUTOVER.
   scope :not_fully_refunded_for_tax_reporting, lambda {
     cutover = Purchase::Reportable::REFUND_REPORTING_CUTOVER.beginning_of_day
@@ -851,37 +821,20 @@ class Purchase < ApplicationRecord
       **chargeback_event_dated_bind_params
     )
   }
-  # Purchases whose chargeback (debit) leg lands in [starts_at, ends_at]: event-dated
-  # chargebacks (see CHARGEBACK_EVENT_DATED_SQL) whose dispute event date falls inside the
-  # window.
-  #
-  # We resolve the window through the disputes table rather than filtering purchases by
-  # purchases.chargeback_date directly: chargeback_date has no standalone index (only a
-  # seller_id-leading composite), so an all-sellers date range over it forces a full scan of
-  # the very large purchases table. chargeback_date mirrors the dispute's event_created_at
-  # (both are set from the same processor event when the dispute is formalized), so listing
-  # the disputes in the window and mapping them back to purchase ids yields the same set at a
-  # fraction of the cost. Any purchase the old chargeback_date predicate could return has a
-  # real charge — and therefore a Dispute row, its own or its Charge's for multi-item carts;
-  # the $0 gift/bundle child purchases that carry a chargeback_date without a Dispute row have
-  # no stripe_transaction_id and are excluded by every caller. The chargeback_date filter is
-  # kept as well so a purchase with several disputes is only selected when its own recorded
-  # chargeback_date is the one inside the window.
+  # Chargeback debit leg in [starts_at, ends_at]: event-dated disputes whose event date is
+  # in the window. Drive off disputes (indexed event_created_at), not purchases.chargeback_date
+  # (no standalone index — all-sellers range would scan purchases). Still filter
+  # chargeback_date so a purchase with several disputes is selected only when its own
+  # recorded date is in the window. $0 gift/bundle children with chargeback_date but no
+  # Dispute row have no stripe_transaction_id and are excluded by every caller.
   scope :chargebacks_for_tax_period_reporting, lambda { |starts_at, ends_at|
     where(id: purchase_ids_for_disputes_in_window(:event_created_at, starts_at, ends_at))
       .where(chargeback_date: starts_at..ends_at)
       .where(CHARGEBACK_EVENT_DATED_SQL, **chargeback_event_dated_bind_params)
   }
-  # Purchases whose chargeback-reversal (dispute won) leg lands in [starts_at, ends_at]:
-  # event-dated chargebacks marked reversed, with a Dispute row — linked directly or through
-  # the purchase's Charge (multi-purchase carts) — recording a won_at inside the window.
-  #
-  # Same reasoning as the debit scope above: drive off the disputes table's won_at (now
-  # indexed) instead of a correlated EXISTS over every purchase. This matches the old EXISTS
-  # exactly — it already required a Dispute row with won_at in the window — while turning the
-  # per-purchase subquery into one small, date-indexed lookup. Callers emitting per-row output
-  # still date the leg with purchase.chargeback_reversal_reporting_date, which also resolves
-  # which dispute row wins when a purchase has several.
+  # Chargeback-reversal (dispute won) leg in [starts_at, ends_at]: same disputes-table
+  # lookup on won_at. Callers still date the row with chargeback_reversal_reporting_date
+  # when a purchase has several disputes.
   scope :chargeback_reversals_for_tax_period_reporting, lambda { |starts_at, ends_at|
     where(id: purchase_ids_for_disputes_in_window(:won_at, starts_at, ends_at))
       .where("purchases.chargeback_date >= ?", Purchase::Reportable::CHARGEBACK_REPORTING_CUTOVER.beginning_of_day)
@@ -1099,7 +1052,7 @@ class Purchase < ApplicationRecord
       purchaser_id: purchaser.try(:external_id),
       is_recurring_billing: link.is_recurring_billing,
       can_contact: can_contact?,
-      is_following: is_following?,
+      is_following: options.key?(:is_following) ? options[:is_following] : is_following?,
       disputed: chargedback?,
       dispute_won: chargeback_reversed?,
       is_additional_contribution:,
@@ -1702,8 +1655,13 @@ class Purchase < ApplicationRecord
 
   # True while a processor-backed purchase has been charged but settlement data has not
   # arrived yet; a finalization job completes the purchase once it does.
+  # Client-confirm deferral can persist the PaymentIntent without a Charge id yet.
   def pending_processor_settlement?
-    in_progress? && stripe_transaction_id.present? && processor_settlement_deferrable? && flow_of_funds.blank?
+    in_progress? && processor_settlement_deferrable? && flow_of_funds.blank? && charged_at_processor?
+  end
+
+  def charged_at_processor?
+    stripe_transaction_id.present? || processor_payment_intent_id.present? || charge&.stripe_payment_intent_id.present?
   end
 
   def pending_buyer_presentment_settlement?
@@ -1764,15 +1722,10 @@ class Purchase < ApplicationRecord
     refunds_that_moved_money.sum { |refund| refund.presentment_snapshot? ? refund.presentment_amount_cents.to_i : 0 }
   end
 
-  # True when this purchase has an effective refund that carries NO buyer-currency
-  # snapshot, which makes buyer_presentment_refunded_cents an incomplete total.
-  #
-  # Refunds issued before #6167 shipped have no presentment snapshot, so they contribute
-  # zero to the sum above. That is the right behaviour for the Sales API (it reports only
-  # what it can attest to), but a seller reading a CSV cannot tell an incomplete total from
-  # a real one — a plausible-looking low number next to a populated USD refund column is
-  # worse than an empty cell. Callers rendering the total for a human use this to blank the
-  # cell instead of publishing a number they'd have to caveat.
+  # True when an effective refund has no buyer-currency snapshot, so
+  # buyer_presentment_refunded_cents is incomplete (pre-#6167 refunds contribute 0).
+  # Sales API reports the partial sum; CSV callers blank the cell so a low number next
+  # to a populated USD refund column is not mistaken for a real total.
   def buyer_presentment_refunded_cents_incomplete?
     refunds_that_moved_money.any? { |refund| !refund.presentment_snapshot? }
   end
@@ -2140,7 +2093,11 @@ class Purchase < ApplicationRecord
   def create_product_affiliate
     return unless affiliate.present? && affiliate.global?
 
+    # Never return create_if_missing!'s "already assigned" false: state_machines terminates the
+    # after_transition chain on a callback returning exactly false, silently skipping every
+    # callback queued below this one — the sale ping included.
     ProductAffiliate.create_if_missing!(affiliate:, product: link)
+    nil
   end
 
   def create_url_redirect_for_failed_purchase
@@ -2842,7 +2799,12 @@ class Purchase < ApplicationRecord
   end
 
   def variants_and_quantity
-    variants_and_quantity_displayable(variant_attributes.not_is_default_sku, quantity)
+    variants = if variant_attributes.loaded?
+      variant_attributes.reject(&:is_default_sku?)
+    else
+      variant_attributes.not_is_default_sku
+    end
+    variants_and_quantity_displayable(variants, quantity)
   end
 
   def is_recurring_subscription_charge
@@ -4600,10 +4562,14 @@ class Purchase < ApplicationRecord
       self.price_cents += shipping_cents
       self.total_transaction_cents += shipping_cents
 
+      apply_buyer_currency_quote_canonical_components!
+      return if errors.present?
+
       calculate_fees
 
       purchase_sales_tax_info.save
       save
+      tip.save! if errors.empty? && tip&.has_changes_to_save?
 
       return unless should_prepare_for_charge
 
@@ -4621,6 +4587,72 @@ class Purchase < ApplicationRecord
       end
 
       chargeable
+    end
+
+    def apply_buyer_currency_quote_canonical_components!
+      components = buyer_currency_quote_canonical_components
+      return if components.blank?
+      # PayPal/Braintree discard the quote before verify!. A leftover token must
+      # not overwrite the USD split, and a stale token must not fail the charge.
+      return unless buyer_currency_quote_components_may_apply?
+
+      component_price_cents = components.fetch(:price_cents).to_i
+      component_tip_cents = components.fetch(:tip_cents).to_i
+      component_seller_tax_cents = components.fetch(:seller_tax_cents).to_i
+      component_gumroad_tax_cents = components.fetch(:gumroad_tax_cents).to_i
+      component_shipping_cents = components.fetch(:shipping_cents).to_i
+      signed_total_cents = component_price_cents + component_tip_cents +
+        component_seller_tax_cents + component_gumroad_tax_cents + component_shipping_cents
+
+      submitted_tip_cents = tip&.value_usd_cents.to_i
+      submitted_price_cents = price_cents.to_i - submitted_tip_cents - shipping_cents.to_i
+      submitted_price_cents -= tax_cents.to_i if was_tax_excluded_from_price
+      submitted_components = [
+        submitted_price_cents,
+        submitted_tip_cents,
+        tax_cents.to_i,
+        gumroad_tax_cents.to_i,
+        shipping_cents.to_i,
+      ]
+      signed_components = [
+        component_price_cents,
+        component_tip_cents,
+        component_seller_tax_cents,
+        component_gumroad_tax_cents,
+        component_shipping_cents,
+      ]
+      # Rounding slack is for FX pennies, not non-price component presence.
+      # Stripe verify! only sees line totals, so a component appearing or
+      # disappearing within slack, or a same-total remap, must fail closed.
+      unless component_tip_cents.positive? == submitted_tip_cents.positive? &&
+          component_seller_tax_cents.positive? == tax_cents.to_i.positive? &&
+          component_gumroad_tax_cents.positive? == gumroad_tax_cents.to_i.positive? &&
+          component_shipping_cents.positive? == shipping_cents.to_i.positive? &&
+          signed_components.zip(submitted_components).all? do |signed_cents, submitted_cents|
+            (signed_cents - submitted_cents).abs <= BUYER_CURRENCY_QUOTE_ROUNDING_SLACK_CENTS
+          end &&
+          (submitted_components.sum - signed_total_cents).abs <= BUYER_CURRENCY_QUOTE_ROUNDING_SLACK_CENTS
+        reject_stale_buyer_currency_quote_components!
+        return
+      end
+
+      tip.value_usd_cents = component_tip_cents if tip.present?
+      self.tax_cents = component_seller_tax_cents
+      self.gumroad_tax_cents = component_gumroad_tax_cents
+      self.shipping_cents = component_shipping_cents
+      self.price_cents = component_price_cents + component_tip_cents
+      self.price_cents += component_seller_tax_cents if was_tax_excluded_from_price
+      self.price_cents += component_shipping_cents
+      self.total_transaction_cents = signed_total_cents
+    end
+
+    def buyer_currency_quote_components_may_apply?
+      charge_processor_id.blank? || stripe_charge_processor?
+    end
+
+    def reject_stale_buyer_currency_quote_components!
+      errors.add :base, Charge::CreateService::BUYER_CURRENCY_QUOTE_INVALID_MESSAGE
+      self.error_code = PurchaseErrorCode::BUYER_CURRENCY_QUOTE_INVALID
     end
 
     def load_flow_of_funds(processor_charge)

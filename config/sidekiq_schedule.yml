@@ -18,6 +18,14 @@ update_purchase_healthcheck_threshold:
   cron: "* * * * *" # Every minute — the threshold carries a 1h TTL, so the healthcheck fails closed if this stalls
   class: UpdatePurchaseHealthcheckThresholdJob
   description: Recomputes the /healthcheck/purchases threshold from the prior 7 days' purchase rate
+flush_delivered_email_infos:
+  cron: "* * * * *" # Every minute
+  class: FlushDeliveredEmailInfosJob
+  description: Applies Redis-buffered email_infos delivered marks from Resend/SendGrid callbacks when the fast-path enqueue was lost
+flush_installment_delivered_deltas:
+  cron: "* * * * *" # Every minute
+  class: FlushInstallmentDeliveredDeltasJob
+  description: Flushes Redis-buffered installment customer_count increments from blast sends and email callbacks
 
 # Hourly
 repair_order_charge_outcomes:
@@ -119,6 +127,11 @@ release_chargeback_rate_payout_pauses:
   class: ReleaseChargebackRatePayoutPausesJob
   queue: low
   description: Lifts automatic chargeback-rate payout holds for sellers whose rate is back under the limit
+record_social_score_shadow_evaluations:
+  cron: "0 9 * * *" # UTC 09:00 daily, after the 07:30 chargeback-rate release so already-lifted holds aren't scored as held
+  class: RecordSocialScoreShadowEvaluationsJob
+  queue: low
+  description: Shadow-mode only — logs whether verified social signals WOULD have released each held payout (gumroad-private#2371); never releases anything
 expire_rental_purchases: # Duration: 45sec
   cron: "0 12 * * *" # UTC 12:00
   class: ExpireRentalPurchasesWorker
@@ -180,6 +193,16 @@ schedule_abandoned_cart_emails:
   cron: "0 14 * * *" # UTC 14:00
   class: ScheduleAbandonedCartEmailsJob
   description: Schedules abandoned cart emails for users who have not completed their purchase
+alert_on_stalled_abandoned_cart_emails:
+  cron: "0 17 * * *" # UTC 17:00, three hours after the send job starts
+  class: AlertOnStalledAbandonedCartEmailsJob
+  queue: low
+  description: Reports when no abandoned cart email has been sent in over a day
+alert_on_zero_buyer_currency_wallet_purchases:
+  cron: "5 * * * *" # hourly, with an in-job 24h zero-volume threshold
+  class: AlertOnZeroBuyerCurrencyWalletPurchasesJob
+  queue: low
+  description: Reports when buyer-currency wallet purchases stay at zero while the flag is enabled
 memberships_price_update_emails:
   cron: "10 8 * * *" # UTC 08:10
   class: SendMembershipsPriceUpdateEmailsJob

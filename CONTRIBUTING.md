@@ -16,7 +16,7 @@ Your PR on your fork is held to the same bar as anything we write. Concretely, a
 - **An AI disclosure** naming the specific model, after a `---` separator.
 - **A self-review** comment on your own diff, and a **What / Why / Before-After / Test Results** description.
 
-The rest of the guidelines below apply too, with the obvious substitutions for working outside this repo: reference `qa-media/` files by your own fork's raw URL (`raw.githubusercontent.com/<your-username>/gumroad/<branch>/...`, not `antiwork/gumroad`), name them `pr-<your-fork-pr-number>-<description>`, and skip the steps that depend on this repo's own infrastructure — preview-app deploys need org credentials you won't have, so we run those ourselves once we pull the change in. Substituting for those is expected; skipping the evidence itself is not.
+The rest of the guidelines below apply too, with the obvious substitutions for working outside this repo: attach your evidence with `gh --attach` (or drag-and-drop into the PR description — both upload to GitHub's asset storage) and skip the steps that depend on this repo's own infrastructure — preview-app deploys need org credentials you won't have, so we run those ourselves once we pull the change in. Substituting for those is expected; skipping the evidence itself is not.
 
 A fork PR that skips the evidence gets the same answer as one of ours that skips it: it isn't ready. If your change is good and documented well, the fork is not a barrier — it's just where the work lives until we pull it in.
 
@@ -57,11 +57,14 @@ Non-trivial PRs should follow this structure:
 - **Before/After** — Video is required for all PRs, except PRs that only touch documentation or agent skill files, where the diff itself is the reviewable artifact. For user-facing changes, show before/after with desktop and mobile, light and dark mode. For non-user-facing changes, include a short video walking through the relevant existing functionality.
 - **Test Results** — List the relevant test commands/checks run. No screenshot of passing specs or terminal output is required.
 
-Store visual evidence screenshots and videos in `qa-media/` using the naming convention `pr-<number>-<description>.<ext>`. From a fork, use your own fork's PR number — it won't match any number here, and that's fine. Reference them in PR descriptions with raw GitHub URLs:
+Attach visual evidence (screenshots and videos) directly to the PR with the GitHub CLI's `--attach` flag (gh 2.99+) — do not commit media files to the repo:
 
-```markdown
-![description](https://raw.githubusercontent.com/antiwork/gumroad/<branch>/qa-media/pr-5160-pagination-page1.png)
+```bash
+gh pr create --title "..." --body-file body.md --attach './before.png#Checkout before' --attach './after.png#Checkout after'
+gh pr comment <number> --attach './demo.mp4'
 ```
+
+Reference an attachment inline in the body as `![alt](./before.png)` and the CLI rewrites it to the uploaded asset URL; unreferenced attachments are appended to the end. Drag-and-drop in the web UI does the same thing.
 
 End with an AI disclosure after a `---` separator. Name the specific model (e.g., "Claude Opus 4.6") and list the prompts given to the agent.
 
@@ -139,7 +142,7 @@ Do not push code with failing tests. CI is not a substitute for local verificati
 
 ### Sidekiq jobs
 
-- The Sidekiq queue names in decreasing order of priority are `critical`, `default`, `low`, and `mongo`. When creating a Sidekiq job select the lowest priority queue you think the job would be ok running in. Most queue latencies are good enough for background jobs. Unless the job is time-sensitive `low` is a good choice otherwise use `default`. The `critical` queue is reserved for receipt/purchase emails and you will almost never need to use it. `mongo` is sort of legacy and we only use it for one-time scripts/bulk migrations/internal tooling.
+- The Sidekiq queue names in decreasing order of priority are `critical`, `default`, and `low`. When creating a Sidekiq job select the lowest priority queue you think the job would be ok running in. Most queue latencies are good enough for background jobs. Unless the job is time-sensitive `low` is a good choice otherwise use `default`. The `critical` queue is reserved for receipt/purchase emails and you will almost never need to use it.
 - New Sidekiq job class names should end with "Job". For example `ProcessBacklogJob`, `CalculateProfitJob`, etc.
 - If you want to deduplicate a job (using sidekiq-unique-jobs), 99% of the time, you're looking for `lock: :until_executed`. It is fast because it works by maintaining a Redis Set of job digests: If a job digest is in this list (`O(1)`), running `perform_async` will be a noop and will return `nil`.
 - Furthermore, you likely should **NOT** use `on_conflict: :replace`, because for it to remove an existing enqueued job, it needs to find it first, by scrolling through the Scheduled Set, which is CPU expensive and slow. It also means that `perform_async` will be as slow as the length of the queue, or fail entirely ⇒ you can break Sidekiq but just having one job like this enqueued too often.

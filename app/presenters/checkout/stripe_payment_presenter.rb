@@ -33,7 +33,7 @@ class Checkout::StripePaymentPresenter
   # threaded into the deferred PaymentIntent by Order::PreparePaymentIntentService, so the Payment Element
   # and the intent cannot drift (Stripe rejects a payment_method_types-scoped ConfirmationToken against a
   # mismatched intent). Direct-listed and method-forced surfaces mount in their listed currency;
-  # every other client-confirm checkout stays in USD.
+  # other client-confirm checkouts start in USD and remount after the quote.
   CLIENT_CONFIRM_CURRENCY = "usd"
 
   attr_reader :cart, :add_products, :clear_cart, :saved_credit_card, :ip
@@ -64,12 +64,16 @@ class Checkout::StripePaymentPresenter
       return payment_element_props(STRIPE_ELEMENTS_MODE_FOR_SETUP_INTENT)
     end
 
-    # Server-confirm: deferred-intent does not consume the quote token.
-    # Before client-confirm — Prepare#block_unexpected_buyer_currency_quote fails closed
-    # on a token rather than charge USD behind a local total.
-    # Unquoted USD-GeoIP candidates take this branch too (no local-method tabs).
-    # Quote candidate + method-forced (EUR listing, CAD buyer) wins here; own-currency
-    # method-forced carts are not candidates and fall through.
+    # Client-confirm can remount a single USD-priced quote (INR UPI, CAD card, etc.).
+    # Quoted carts it cannot remount — non-USD listings, multi-line USD — stay on the
+    # server-confirm presentment element: prepare honors that quote, and stealing them
+    # onto unmarked client-confirm hid the quote while the currency picker stayed on.
+    # Own-currency method-forced / unquoted carts still take client-confirm.
+    if client_confirm_eligible?
+      quoted = buyer_currency_presentment_element_shape?(checkout_items)
+      return client_confirm_props unless quoted && !client_confirm_quote_remount?
+    end
+
     if buyer_currency_presentment_element_shape?(checkout_items)
       return payment_element_props(
         STRIPE_ELEMENTS_MODE_FOR_PAYMENT_INTENT,
@@ -82,8 +86,6 @@ class Checkout::StripePaymentPresenter
     # one-time carts are one-time, and the UPI Autopay membership shape is paid upfront (it
     # excludes preorders and free trials), registering reuse on a PaymentIntent rather than a
     # SetupIntent.
-    return client_confirm_props if client_confirm_eligible?
-
     payment_element_props(STRIPE_ELEMENTS_MODE_FOR_PAYMENT_INTENT)
   end
 
@@ -142,6 +144,9 @@ class Checkout::StripePaymentPresenter
           # the browser mounts canonical USD exactly as if this flag were false.
           buyer_currency_presentment:,
           payment_method_types: ["card"],
+          # UPI confirm is the deferred client-confirm path. Advertising it here mounts
+          # a method this manual-creation card Element cannot charge.
+          inr_local_methods: [],
           payment_method_creation: "manual",
           # Link auto-enables with the Payment Element: it's inline (PaymentMethod-mode here, no
           # return-page/webhook dependency), and Stripe's dashboard payment-method settings remain
@@ -263,33 +268,47 @@ class Checkout::StripePaymentPresenter
       else
         CLIENT_CONFIRM_CURRENCY
       end
+      quote_remount = client_confirm_quote_remount?
+      inr_local_method_types = (quote_remount || listed_currency) ? inr_local_methods : []
+      # Never list a forced-currency method on an element that is not mounted in that
+      # currency — Stripe rejects the whole session, card included. UPI for a USD-priced
+      # cart is added only after the browser remounts in INR (inr_local_methods).
+      payment_method_types = Array(payment_method_types).reject do |payment_method_type|
+        forced_currency = Checkout::BuyerCurrencyEligibility.forced_currency_for(payment_method_type)
+        forced_currency.present? && forced_currency != element_currency
+      end
       # Listed-currency Elements stay wallet-free until their sheet can be guaranteed to carry
       # the same final tax/tip/shipping total as the deferred intent.
-      disable_wallets = listed_currency || items.any? { buyer_currency_presentment_candidate?(_1) }
+      disable_wallets = listed_currency || items.any? { buyer_currency_presentment_candidate?(_1) } || inr_local_method_types.any? || quote_remount
       if listed_currency
         # The ConfirmationToken inherits this currency and method set. Keep only methods the
         # matching non-USD intent can accept; prepare applies the same restrictions.
         payment_method_types -= Checkout::PaymentMethodResolver::US_LOCKED_PAYMENT_METHOD_TYPES
         payment_method_types -= [Checkout::PaymentMethodResolver::KLARNA_PAYMENT_METHOD_TYPE,
                                  Checkout::PaymentMethodResolver::ALIPAY_PAYMENT_METHOD_TYPE]
-        payment_method_types = payment_method_types.reject do |payment_method_type|
-          forced_currency = Checkout::BuyerCurrencyEligibility.forced_currency_for(payment_method_type)
-          forced_currency.present? && forced_currency != element_currency
-        end
       end
+      signed_listed_rate = listed_currency ? listed_lane_rate(items) : nil
       elements_options = {
         stripe_elements_mode: STRIPE_ELEMENTS_MODE_FOR_PAYMENT_INTENT,
         currency: element_currency,
+        buyer_currency_presentment: quote_remount,
         presentment_amount_cents: listed_currency ? listed_element_amount_cents : nil,
         listed_currency_display: listed_currency ? {
           currency: element_currency,
           subunit_to_unit: subunit_to_unit(element_currency),
         } : nil,
         payment_method_types:,
-        payment_method_list_token: Checkout::PaymentMethodListToken.issue(payment_method_types:, sellers:),
+        inr_local_methods: inr_local_method_types,
+        payment_method_list_token: issued_payment_method_list_token(
+          payment_method_types,
+          inr_local_method_types:,
+          direct_listed_currency: listed_currency ? element_currency : nil,
+          direct_listed_currency_rate: signed_listed_rate,
+        ),
         stripe_link_enabled: payment_method_types.include?(Checkout::PaymentMethodResolver::LINK_PAYMENT_METHOD_TYPE),
         stripe_connect_account_id: resolution.stripe_connect_account_id,
       }
+      elements_options[:direct_listed_currency_rate] = signed_listed_rate if signed_listed_rate.present?
       elements_options[:direct_listed_card] = true if direct_listed_card
 
       {
@@ -385,6 +404,73 @@ class Checkout::StripePaymentPresenter
       end
     end
 
+    # Methods a quoted remount can list. Cash App / ACH / Klarna / Alipay are USD-only;
+    # leaving them on a CAD/INR Element rejects the whole session, card included.
+    def quoted_remount_payment_method_types(payment_method_types)
+      payment_method_types -
+        Checkout::PaymentMethodResolver::US_LOCKED_PAYMENT_METHOD_TYPES -
+        [Checkout::PaymentMethodResolver::KLARNA_PAYMENT_METHOD_TYPE,
+         Checkout::PaymentMethodResolver::ALIPAY_PAYMENT_METHOD_TYPE]
+    end
+
+    def issued_payment_method_list_token(payment_method_types, inr_local_method_types: inr_local_methods, direct_listed_currency: nil, direct_listed_currency_rate: nil)
+      quoted_types = quoted_remount_payment_method_types(payment_method_types)
+      inr_types = (quoted_types + inr_local_method_types).uniq
+      Checkout::PaymentMethodListToken.issue(
+        payment_method_types:,
+        sellers:,
+        quoted_payment_method_types: quoted_types,
+        inr_payment_method_types: inr_local_method_types.present? ? inr_types : nil,
+        direct_listed_currency:,
+        direct_listed_currency_rate:,
+      )
+    end
+
+    # UPI on a USD-priced cart cannot ride the USD Payment Element (Stripe rejects the
+    # session). After the surcharge quote remounts the element in INR, the browser adds
+    # these methods. Recurring/commission/setup carts stay off — they cannot take one-shot UPI.
+    def inr_local_methods
+      return [] unless sellers.one?
+      return [] unless buyer_country == Checkout::PaymentMethodResolver::IN_ALPHA2
+      return [] if items.any? { _1[:recurrence].present? || _1[:pay_in_installments] || _1[:native_type] == Link::NATIVE_TYPE_COMMISSION }
+      return [] if setup_for_future_charges_without_charging?(items)
+      seller = sellers.first
+      return [] unless Checkout::BuyerCurrencyEligibility.seller_enabled?(seller)
+      return [] unless Checkout::BuyerCurrencyEligibility.stripe_test_mode? ||
+                       Checkout::BuyerCurrencyEligibility.local_method_launched?("upi", seller)
+
+      inr_method_resolution.payment_method_types & Checkout::PaymentMethodResolver::IN_LOCKED_PAYMENT_METHOD_TYPES
+    end
+
+    def inr_method_resolution
+      Checkout::PaymentMethodResolver.new(
+        sellers: [sellers.first],
+        recurring: false,
+        commission: false,
+        setup_for_future: false,
+        buyer_country:,
+        ppp_discounted: ppp_verification_applies?,
+        cart_product_currency: Currency::INR,
+        cart_total_usd_cents: nil,
+        recurring_upi_registration: false
+      ).resolve
+    end
+
+    # Client-confirm remounts the element in the quoted buyer currency. Wallets stay off
+    # because their sheet cannot carry that locked total.
+    def client_confirm_quote_remount?
+      return false unless sellers.one? && sellers.all? { Checkout::BuyerCurrencyEligibility.seller_enabled?(_1) }
+
+      currency = buyer_currency_for_ip(ip).to_s.downcase.presence
+      return false if currency.blank? || currency == Currency::USD
+      return false unless StripeChargeProcessor.charge_minor_units_compatible?(currency)
+
+      # Prepare can honor the displayed quote today only for a single USD-priced line. Multi-line
+      # USD carts and non-USD listing quotes still need the per-line quote basis work before a
+      # single client-confirm intent can safely leave USD.
+      items.one? && items.first[:product_currency] == Currency::USD
+    end
+
     def recurring_upi_registration_shape?(items)
       return false unless items.one?
 
@@ -437,6 +523,18 @@ class Checkout::StripePaymentPresenter
     def listed_lane_rates_uniform?(items)
       rates = items.map { _1[:exchange_rate].to_f }
       rates.all?(&:positive?) && rates.uniq.one?
+    end
+
+    # Page payloads store the display rate (USD cents × rate = listed minor units). JPY's
+    # display rate is already divided by 100; usd_cents_to_currency expects the raw OXR
+    # rate and applies that /100 itself. Sign the raw rate so the Element and charge agree.
+    def listed_lane_rate(items)
+      return nil unless listed_lane_rates_uniform?(items)
+
+      scaled = items.first[:exchange_rate]
+      return nil unless scaled.to_f.positive?
+
+      scaled.to_f * (is_currency_type_single_unit?(items.first[:product_currency]) ? 100 : 1)
     end
 
     def method_forced_element_currency
@@ -533,28 +631,12 @@ class Checkout::StripePaymentPresenter
       end
     end
 
-    # The saved-cart twin of buyer_can_name_price? below. A cart line records the tier the buyer
-    # picked in `option`, so the same rule applies: what decides whether a price is still unknown
-    # is the SELECTED tier, not whether the membership happens to offer a pay-what-you-want tier
-    # somewhere. `Link#has_customizable_price_option?` answers the latter — it scans every alive
-    # tier — so a cart line on a free non-pay-what-you-want tier of a membership that also sells a
-    # pay-what-you-want tier reported a customizable price, suppressed the "not_charged"
-    # classification, and mounted the Payment Element on a checkout that charges nothing.
-    #
-    # Only a TIERED MEMBERSHIP's option carries the flag. `Variant::Prices#set_customizable_price`
-    # returns early for anything else, so an ordinary product's variants always read false even
-    # when the product itself is pay-what-you-want — reading the option there would wrongly call a
-    # real pay-what-you-want cart free. For a non-membership the product's own
-    # `customizable_price` column is authoritative, which is what has_customizable_price_option?
-    # returns for that case.
-    #
-    # A membership line with NO tier recorded reads false rather than deferring to the product.
-    # Both of the product-level answers available here are wrong for it: the tier scan inside
-    # has_customizable_price_option? is the product-wide question this method exists to stop
-    # asking (one pay-what-you-want tier would speak for a line that selected none), and the
-    # `customizable_price` column is unreliable on memberships — it can be stale-true, which is
-    # why buyer_can_name_price? guards it too. On a membership the buyer names a price only
-    # through a tier, so with no tier there is no pending amount and the price is known.
+    # Saved-cart twin of buyer_can_name_price?: unknown price follows the selected tier
+    # (`option`). Link#has_customizable_price_option? scans every alive tier and would
+    # mount Payment Element on a free non-PWYW tier of a mixed membership.
+    # Only a tiered membership's option carries the flag (Variant::Prices#set_customizable_price
+    # early-returns otherwise — a non-membership variant is always false even on PWYW products).
+    # No recorded tier → false; product-level answers are wrong (see stale-true below).
     def cart_line_buyer_can_name_price?(cart_product)
       product = cart_product.product
       return product.has_customizable_price_option? unless product.is_tiered_membership?
@@ -563,36 +645,18 @@ class Checkout::StripePaymentPresenter
       option.present? && option.customizable_price?
     end
 
-    # Whether the buyer can still name their own price for this line, which fallback_reason_for
-    # must not read as "free" (see the zero-total comment there).
+    # Whether the buyer can still name a price — fallback_reason_for must not treat that as
+    # "free" (see the zero-total comment there). Product-level `pwyw` is not tier-aware.
     #
-    # The product-level `pwyw` field is not enough on its own, because it is not tier-aware. For a
-    # tiered membership the TIER carries the flag, via `Variant::Prices` — so the tier is what has
-    # to be consulted, and the product column must not be trusted. A $0 pay-what-you-want
-    # membership opened through /checkout?product=… fell back to CardElement while the same product
-    # added from a saved cart did not.
+    # On a membership the TIER carries the flag (`Variant::Prices`). The product column can
+    # be stale-true: Product::Prices#write_customizable_price runs via price_range= before
+    # is_tiered_membership is set, so a $0 starting price persists customizable_price=true,
+    # and set_customizable_price after_save early-returns for memberships. The column is
+    # also writable on the web and v2 API. Trusting it would mount Payment Element on a
+    # genuinely free membership tier.
     #
-    # Note the product column can be STALE-true on a membership, which is why this reads
-    # `is_tiered_membership` before trusting `pwyw` at all. During create,
-    # `Product::Prices#write_customizable_price` runs (via `price_range=`) while
-    # `is_tiered_membership` is still false, so any membership created with a $0 starting price
-    # persists `customizable_price = true`; the `set_customizable_price` after_save callback
-    # early-returns for memberships, so nothing ever clears it. `customizable_price` is also a
-    # directly writable param on both the web and v2 API update paths. Trusting it here would mount
-    # the Payment Element on a genuinely free membership tier — the defect this method's
-    # selected-tier check exists to prevent — and would disagree with
-    # cart_line_buyer_can_name_price?, which already guards on the membership flag first.
-    #
-    # The tier-level check has to look at the tier the buyer actually SELECTED, not at every tier
-    # the product offers. `options` lists all of them, so asking "does any option allow naming a
-    # price" says yes for a membership that merely HAS a pay-what-you-want tier somewhere — which
-    # would suppress the "free" classification even when the buyer picked a genuinely free tier
-    # with no amount to charge, and mount the Payment Element on a checkout that charges nothing.
-    # `option_id` is the selected tier (CheckoutPresenter sets it from the accepted upsell, the
-    # cart item, or an upgrading subscription's current tier), so scope the check to that option.
-    # A membership with no option_id has no selected tier, and a membership's price can only be
-    # named through a tier, so there is no pending amount and the price is known — the same answer
-    # cart_line_buyer_can_name_price? gives a cart line with no option.
+    # Check the selected option_id (upsell / cart item / upgrading subscription tier), not
+    # every offered tier. No option_id → price known, same as cart_line with no option.
     def buyer_can_name_price?(checkout_product)
       product = checkout_product[:product]
       return product[:pwyw].present? unless product[:is_tiered_membership]

@@ -85,6 +85,7 @@ import { ReviewCard } from "$app/components/TiptapExtensions/ReviewCard";
 import { UpsellCard } from "$app/components/TiptapExtensions/UpsellCard";
 import { Alert } from "$app/components/ui/Alert";
 import { Card, CardContent } from "$app/components/ui/Card";
+import { LinkButton } from "$app/components/ui/LinkButton";
 import { useAddThirdPartyAnalytics } from "$app/components/useAddThirdPartyAnalytics";
 import { useOnChange } from "$app/components/useOnChange";
 import { useOriginalLocation } from "$app/components/useOriginalLocation";
@@ -431,7 +432,9 @@ export const Product = ({
             {product.name}
           </h1>
         </header>
-        <section className="grid grid-cols-[auto_1fr] gap-[1px] border-t border-border p-0 sm:grid-cols-[auto_auto_minmax(max-content,1fr)]">
+        {/* Stack on mobile: an inflated price in an auto track leaves the name ~1ch
+            wide, and overflow-wrap:anywhere then stacks it one character at a time. */}
+        <section className="grid grid-cols-1 gap-[1px] border-t border-border p-0 sm:grid-cols-[auto_auto_minmax(max-content,1fr)]">
           {showPrice ? (
             <div className="px-6 py-4 outline outline-offset-0 outline-border">
               <PriceTag
@@ -461,7 +464,7 @@ export const Product = ({
           {sellerByline ? (
             <div
               className={classNames(
-                "flex flex-wrap items-center gap-2 px-6 py-4 outline outline-offset-0 outline-border",
+                "flex min-w-0 flex-wrap items-center gap-2 px-6 py-4 outline outline-offset-0 outline-border",
                 !showPrice && "col-span-full sm:col-auto",
                 showPrice && !(product.ratings != null && product.ratings.count > 0) && "sm:col-[2/-1]",
               )}
@@ -515,10 +518,11 @@ export const Product = ({
                       });
                 return (
                   <CartItem key={bundleProduct.id} isBundleItem>
-                    <CartItemMedia className="h-28 w-28">
+                    <CartItemMedia className="h-16 w-16 shrink-0 sm:h-28 sm:w-28">
                       <Thumbnail url={bundleProduct.thumbnail_url} nativeType={bundleProduct.native_type} />
                     </CartItemMedia>
-                    <CartItemMain className="h-28">
+                    {/* Checkout's floor: without it a wide price squeezes this to one letter/line. */}
+                    <CartItemMain className="min-h-16 min-w-2/5 sm:h-28">
                       <CartItemTitle asChild>
                         <a href={bundleProduct.url}>
                           <h4 className="font-bold">{bundleProduct.name}</h4>
@@ -539,7 +543,7 @@ export const Product = ({
                         </CartItemFooter>
                       ) : null}
                     </CartItemMain>
-                    <CartItemEnd className="flex-row items-start gap-4 p-4">
+                    <CartItemEnd className="max-w-1/2 flex-row items-start gap-4 p-4 text-right">
                       <span className="current-price" aria-label="Price">
                         {comparisonPriceCents !== null && discountedPriceCents < comparisonPriceCents ? (
                           <s>{price}</s>
@@ -1000,13 +1004,9 @@ const Reviews = ({
             />
           ))}
           {state.pagination.page < state.pagination.pages ? (
-            <button
-              className="cursor-pointer underline all-unset"
-              onClick={() => void loadNextPage()}
-              disabled={isLoading}
-            >
+            <LinkButton onClick={() => void loadNextPage()} disabled={isLoading}>
               Load more
-            </button>
+            </LinkButton>
           ) : null}
         </section>
       ) : null}

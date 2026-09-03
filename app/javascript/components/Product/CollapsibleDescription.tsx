@@ -1,6 +1,9 @@
+import { ChevronDown } from "@boxicons/react";
 import * as React from "react";
 
 import { classNames } from "$app/utils/classNames";
+
+import { LinkButton } from "$app/components/ui/LinkButton";
 
 // On mobile, the product description sits above the purchase controls in a single-column layout,
 // so a long description buries the price and CTA far down the page. We collapse tall descriptions
@@ -44,13 +47,20 @@ export const CollapsibleDescription = ({ children }: { children: React.ReactNode
         <div ref={contentRef}>{children}</div>
       </div>
       {isCollapsible ? (
-        <button
-          className="mt-4 cursor-pointer underline all-unset lg:hidden"
+        <LinkButton
+          className="mt-4 inline-flex items-center gap-1 lg:hidden"
           aria-expanded={isExpanded}
           onClick={() => setIsExpanded(!isExpanded)}
         >
+          <ChevronDown
+            aria-hidden="true"
+            className={classNames(
+              "size-5 shrink-0 transition-transform duration-200 ease-out motion-reduce:transition-none",
+              isExpanded && "rotate-180",
+            )}
+          />
           {isExpanded ? "Show less" : "Read more"}
-        </button>
+        </LinkButton>
       ) : null}
     </>
   );

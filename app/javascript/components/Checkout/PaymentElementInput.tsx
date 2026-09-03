@@ -19,6 +19,7 @@ import {
 } from "$app/components/Checkout/checkoutTheme";
 import {
   STRIPE_ELEMENTS_MODE_FOR_SETUP_INTENT,
+  paymentMethodTypesForMountCurrency,
   type PaymentElementConfig,
   type PaymentElementClientConfirmConfig,
 } from "$app/components/Checkout/payment";
@@ -27,7 +28,7 @@ import { useFont } from "$app/components/DesignSettings";
 import { LoadingSpinner } from "$app/components/LoadingSpinner";
 import { Fieldset } from "$app/components/ui/Fieldset";
 
-export type PaymentElementController = { stripe: Stripe; elements: StripeElements };
+export type PaymentElementController = { stripe: Stripe; elements: StripeElements; mountCurrency: string };
 
 // Server-confirm and client-confirm integrations share the Payment Element; only
 // server-confirm sets payment_method_creation: "manual".
@@ -181,6 +182,7 @@ export const PaymentElementInput = ({
         >
           <PaymentElementControllerInput
             amount={mountedAmount}
+            mountCurrency={mountedCurrency ?? elementsOptions.currency}
             disabled={disabled}
             stripeLinkEnabled={elementsOptions.stripe_link_enabled}
             walletsEnabled={walletsEnabled}
@@ -207,6 +209,7 @@ export const PaymentElementInput = ({
 
 const PaymentElementControllerInput = ({
   amount,
+  mountCurrency,
   disabled,
   stripeLinkEnabled,
   walletsEnabled,
@@ -222,6 +225,7 @@ const PaymentElementControllerInput = ({
   onTouched,
 }: {
   amount: number | null;
+  mountCurrency: string;
   disabled?: boolean | undefined;
   stripeLinkEnabled: boolean;
   walletsEnabled: boolean;
@@ -254,9 +258,9 @@ const PaymentElementControllerInput = ({
   const billingDetailsCollection = paymentElementBillingDetailsCollection(selectedType, hasShippingCart);
 
   React.useEffect(() => {
-    onReady(stripe && elements && ready ? { stripe, elements } : null);
+    onReady(stripe && elements && ready ? { stripe, elements, mountCurrency } : null);
     return () => onReady(null);
-  }, [stripe, elements, ready, onReady]);
+  }, [stripe, elements, ready, mountCurrency, onReady]);
 
   React.useEffect(() => {
     if (amount !== null) elements?.update({ amount });
@@ -412,7 +416,7 @@ const StripePaymentElementProvider = ({
       currency,
       ...(initialAmount === null ? {} : { amount: initialAmount }),
       ...(setupFutureUsage ? { setupFutureUsage } : {}),
-      paymentMethodTypes: elementsOptions.payment_method_types,
+      paymentMethodTypes: paymentMethodTypesForMountCurrency(elementsOptions, currency),
       // Stripe rejects createConfirmationToken({ elements }) when payment_method_creation is manual.
       ...("payment_method_creation" in elementsOptions
         ? { paymentMethodCreation: elementsOptions.payment_method_creation }
@@ -488,7 +492,7 @@ const StripePaymentElementProvider = ({
         },
       },
     }),
-    [colors, currency, elementsOptions, fontFamily, initialAmount, setupFutureUsage, flatLayout, stripeFonts],
+    [colors, currency, elementsOptions, flatLayout, fontFamily, initialAmount, setupFutureUsage, stripeFonts],
   );
 
   return (

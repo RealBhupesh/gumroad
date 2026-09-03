@@ -65,6 +65,8 @@ import {
   getCheckoutListedCurrencyAmounts,
   getCheckoutListedCurrencyDisplay,
   getCheckoutPresentmentAmounts,
+  getMatchingDirectListedAllocations,
+  isRecurringUpiPaymentConfig,
   toBuyerCurrencyCents,
   toCanonicalCents,
 } from "./buyerCurrencyDisplay";
@@ -77,6 +79,7 @@ import {
   findCartItem,
 } from "./cartState";
 import {
+  canDisplayBuyerCurrencyQuote,
   canUseStripePaymentElementClientConfirm,
   computeTip,
   computeTipForListedLines,
@@ -143,26 +146,48 @@ const CurrencyPicker = ({
   const [state, dispatch] = useState();
   const uid = React.useId();
   const availableOptions = surcharges?.available_buyer_currencies ?? [];
+  const directListedCurrencyOptionAvailable =
+    configuredDirectListedCurrency !== null && selectableDirectListedCurrency === configuredDirectListedCurrency;
+  const directListedUsdOptionAvailable =
+    configuredDirectListedCurrency !== null && availableOptions.some((option) => option.code === "usd");
+  const directListedUsdFallbackAvailable =
+    directListedUsdOptionAvailable &&
+    !directListedCurrencyOptionAvailable &&
+    state.buyerCurrency?.toLowerCase() === "usd";
   const options = configuredDirectListedCurrency
-    ? availableOptions.filter((option) => option.code === "usd" || option.code === configuredDirectListedCurrency)
+    ? availableOptions.filter(
+        (option) =>
+          option.code === "usd" ||
+          (directListedCurrencyOptionAvailable && option.code === configuredDirectListedCurrency),
+      )
     : availableOptions;
   const detected = surcharges?.detected_buyer_currency ?? null;
+  const quoted = surcharges?.buyer_currency_quote?.currency ?? null;
   // Unset buyerCurrency is the listed-currency default on this lane (mount treats
   // `null !== "usd"` as listed). Prefer that over GeoIP / options[0] or the picker
   // shows USD while the summary and Payment Element stay CAD.
-  const preferred = state.buyerCurrency ?? selectableDirectListedCurrency ?? detected ?? "usd";
+  // On the general quote lane, a non-USD selection is real only when this response carries its
+  // quote. The settlement menu can still list a currency that this cart cannot quote, so using the
+  // menu alone would leave that currency selected beside canonical USD totals.
+  const preferred = configuredDirectListedCurrency
+    ? (state.buyerCurrency ?? selectableDirectListedCurrency ?? detected ?? "usd")
+    : isRequoting
+      ? (state.buyerCurrency ?? quoted ?? "usd")
+      : state.buyerCurrency === "usd"
+        ? "usd"
+        : (quoted ?? "usd");
   const value = options.some((option) => option.code === preferred)
     ? preferred
     : detected && options.some((option) => option.code === detected)
       ? detected
       : (options[0]?.code ?? "usd");
   const canChooseCurrency =
-    options.length >= 2 &&
+    (options.length >= 2 || directListedUsdFallbackAvailable) &&
     state.paymentMethod === "card" &&
     !isWalletPaymentElementType(state.paymentElementType) &&
     (configuredDirectListedCurrency
-      ? selectableDirectListedCurrency === configuredDirectListedCurrency
-      : !state.willSaveCard && !isListedCurrency);
+      ? directListedCurrencyOptionAvailable || directListedUsdFallbackAvailable
+      : canDisplayBuyerCurrencyQuote(state) && !state.willSaveCard && !isListedCurrency);
 
   React.useEffect(() => {
     if (!canChooseCurrency || state.buyerCurrency == null || state.buyerCurrency === value) return;
@@ -327,11 +352,11 @@ export const Checkout = ({
       0,
     ) + computeTip(state);
 
-  // The quote the summary renders from. While a currency change is being re-quoted that is the
-  // quote the change replaced, so the card keeps its rows — and the picker sitting under them —
-  // instead of folding up around the control the buyer just used. Everything that gates paying
-  // still reads `state.surcharges` (isSubmitDisabled, the Element amount, the submitted quote
-  // token), so no amount shown from here can be charged.
+  // The quote the summary renders from. While a currency change or tip edit is being re-quoted,
+  // that is the quote the change replaced, so the card keeps its rows — and the currency format
+  // of the input the buyer is editing — instead of folding or briefly reverting to USD.
+  // Everything that gates paying still reads `state.surcharges` (isSubmitDisabled, the Element
+  // amount, the submitted quote token), so no amount shown from here can be charged.
   const summarySurcharges =
     state.surcharges.type === "loaded" ? state.surcharges.result : (state.buyerCurrencyRemint?.surcharges ?? null);
   // Only while a replacement is actually in flight. An errored fetch keeps the snapshot on screen
@@ -368,14 +393,18 @@ export const Checkout = ({
   const selectableDirectListedCurrency = getSelectableDirectListedCurrency(state, {
     usingSavedCard: displayedUsingSavedCard,
   });
-  const buyerCurrencyDisplay = configuredDirectListedCurrency
-    ? null
-    : getCheckoutBuyerCurrencyDisplay(summarySurcharges, {
-        cartPermalinks: cart.items.map((item) => item.product.permalink),
-        willSaveCard: state.willSaveCard,
-        paymentMethod: state.paymentMethod,
-        paymentElementType: state.paymentElementType,
-      });
+  // Recurring UPI is a server-selected INR registration lane: the Element amount and mount
+  // currency already pin INR (see getStripePaymentElementAmount), so neither a stored USD
+  // preference nor an FX quote may repaint the summary in another currency.
+  const recurringUpiRegistration = isRecurringUpiPaymentConfig(state.checkoutPayment);
+  const buyerCurrencyDisplay =
+    configuredDirectListedCurrency || recurringUpiRegistration || !canDisplayBuyerCurrencyQuote(state)
+      ? null
+      : getCheckoutBuyerCurrencyDisplay(summarySurcharges, {
+          cartPermalinks: cart.items.map((item) => item.product.permalink),
+          willSaveCard: state.willSaveCard,
+          paymentMethod: state.paymentMethod,
+        });
   // The buyer-currency amounts every row of the table renders from, so the visible numbers
   // sum exactly to the locked total the buyer is charged. An unusable allocation makes
   // buyerCurrencyDisplay null above, keeping every row and the submitted token canonical.
@@ -404,8 +433,10 @@ export const Checkout = ({
     ? state.buyerCurrencyRemint.previousCurrency
     : state.buyerCurrency;
   const directListedCurrencySelected =
-    configuredDirectListedCurrency === null ||
-    (selectableDirectListedCurrency !== null && displayedBuyerCurrency?.toLowerCase() !== "usd");
+    recurringUpiRegistration ||
+    (configuredDirectListedCurrency === null
+      ? !(state.paymentMethod === "card" && displayedBuyerCurrency?.toLowerCase() === "usd")
+      : selectableDirectListedCurrency !== null && displayedBuyerCurrency?.toLowerCase() !== "usd");
   const listedCurrency =
     buyerCurrencyDisplay || !canUseStripePaymentElementClientConfirm(state) || !directListedCurrencySelected
       ? null
@@ -422,6 +453,13 @@ export const Checkout = ({
     price: hasFreeTrial(item, isGift) ? 0 : getDiscountedPrice(cart, item).price,
     permalink: item.product.permalink,
   }));
+  // When the server sent a listed-currency split for this cart, the sheet and the charge are both
+  // built from it, so the summary has to add up the same per-line rounding rather than converting
+  // the USD aggregate once.
+  const listedAllocations = getMatchingDirectListedAllocations(
+    summarySurcharges,
+    cart.items.map((item) => item.product.permalink),
+  );
   const listedAmounts = getCheckoutListedCurrencyAmounts(listedCurrency, {
     lines: cart.items.map((item) => ({
       priceCents: hasFreeTrial(item, isGift) ? 0 : item.price * item.quantity,
@@ -435,6 +473,8 @@ export const Checkout = ({
     usdTaxCents: summarySurcharges?.tax_cents ?? 0,
     usdTaxIncludedCents: summarySurcharges?.tax_included_cents ?? 0,
     usdShippingCents: summarySurcharges?.shipping_rate_cents ?? 0,
+    listedTaxCents: listedAllocations?.reduce((sum, allocation) => sum + allocation.tax_cents, 0),
+    listedShippingCents: listedAllocations?.reduce((sum, allocation) => sum + allocation.shipping_cents, 0),
   });
   // The one currency the whole summary is formatted in: the FX-quoted buyer currency when a quote
   // is being displayed, else the listed currency on the method-forced lane, else canonical USD
@@ -724,8 +764,8 @@ const TipSelector = ({
 }: {
   buyerCurrencyDisplay?: CheckoutLocalCurrencyFormat | null;
   presentmentTipCents?: number | null;
-  // True while checkout displays the listed-currency lane. A positive tip moves the direct-card
-  // ramp back to USD; the method-forced lane preserves the listed tip exactly as typed.
+  // True while checkout displays the listed-currency lane. The listed lane preserves fixed tips
+  // exactly as typed instead of round-tripping them through canonical USD cents.
   isListedCurrency?: boolean;
 }) => {
   const [state, dispatch] = useState();
@@ -751,11 +791,15 @@ const TipSelector = ({
   const fixedTipCents =
     state.tip.type !== "fixed" || state.tip.amount == null
       ? null
-      : buyerCurrencyDisplay && presentmentTipCents != null
-        ? presentmentTipCents
-        : buyerCurrencyDisplay
-          ? toBuyerCurrencyCents(state.tip.amount, buyerCurrencyDisplay)
-          : state.tip.amount;
+      : buyerCurrencyDisplay &&
+          state.tip.presentmentAmount != null &&
+          state.tip.presentmentCurrency?.toLowerCase() === buyerCurrencyDisplay.currencyCode.toLowerCase()
+        ? state.tip.presentmentAmount
+        : buyerCurrencyDisplay && presentmentTipCents != null
+          ? presentmentTipCents
+          : buyerCurrencyDisplay
+            ? toBuyerCurrencyCents(state.tip.amount, buyerCurrencyDisplay)
+            : state.tip.amount;
 
   return (
     <div className="@container flex flex-col gap-2 sm:gap-3">
@@ -822,6 +866,8 @@ const TipSelector = ({
                   // it. `amount` above stays the canonical USD source of truth every other
                   // consumer reads; this is only consulted on that one lane.
                   listedAmount: isListedCurrency ? newAmount : null,
+                  presentmentAmount: buyerCurrencyDisplay ? newAmount : null,
+                  presentmentCurrency: buyerCurrencyDisplay?.currencyCode ?? null,
                 },
               });
             }}

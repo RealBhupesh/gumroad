@@ -86,7 +86,7 @@ class Checkout::BuyerCurrencyEligibility
   # a currency prepare refuses for a reason already visible in the cart. What is left over is
   # purchase-only (a snapshotted displayed_price_currency_type that moved under the checkout, a
   # wallet or off-session submit) and still falls back there.
-  def self.direct_listed_line_items_eligible?(line_items:, buyer_currency:)
+  def self.direct_listed_line_items_eligible?(line_items:, buyer_currency:, require_listed_direct_charge: true)
     return false if line_items.blank?
 
     currency = buyer_currency.to_s.downcase
@@ -100,19 +100,30 @@ class Checkout::BuyerCurrencyEligibility
 
     seller = line_items.first.product.user
     return false unless seller_enabled?(seller)
-    return false unless listed_currency_direct_charge_enabled?(seller)
+    # Method-forced iDEAL/Bancontact/UPI/Pix already charge in the listed currency without
+    # the listed-card ramp; skip that flag only when the caller is allocating that mount.
+    return false if require_listed_direct_charge && !listed_currency_direct_charge_enabled?(seller)
     # #decision refuses at :unsupported_processor / :unsupported_charge_model before it reaches
     # the listed-currency gates, so a seller whose charging account cannot create the intent has
     # no listed lane to advertise.
     merchant_account = charging_merchant_account(seller)
     return false unless merchant_account&.stripe_charge_processor?
-    return false unless supported_merchant_account?(merchant_account, seller:)
+    # Method-forced allocations take #method_forced_decision's charge-model gate, not the card
+    # lane's: a Custom account already charges this lane as a DESTINATION without the card-lane
+    # ramp flag, and refusing it here leaves the Element with no allocations or amount token.
+    if require_listed_direct_charge
+      return false unless supported_merchant_account?(merchant_account, seller:)
+    else
+      return false unless supported_forced_currency_charge_model?(merchant_account)
+    end
     # The product shapes #decision refuses at :unsupported_product_type. `later_charge_kind`
     # below happens to exclude most of them, but it is computed by the caller — free trials and
     # out-of-ramp later-charge products are facts about the product, and are checked as such.
     return false if line_items.any? { unquotable_product?(_1.product) }
     return false if line_items.any? { _1.later_charge_kind.present? }
-    return false if line_items.any? { _1.tip_cents.to_i.positive? || _1.shipping_cents.to_i.positive? }
+    # Method-forced allocations convert per-line shipping at the signed page rate, so a physical
+    # line must stay eligible there or the Element mounts without the shipping prepare includes.
+    return false if require_listed_direct_charge && line_items.any? { _1.shipping_cents.to_i.positive? }
 
     rates = line_items.map { _1.listed_currency_rate.presence }
     rates.all? && rates.map(&:to_s).uniq.one? && rates.first.to_d.positive?
@@ -151,6 +162,15 @@ class Checkout::BuyerCurrencyEligibility
       Feature.active?(FEATURE_NAME, seller) &&
       Feature.active?(:buyer_local_currency, seller) &&
       !seller.disable_buyer_local_currency?
+  end
+
+  # True when `currency` is one a launched local method can charge (INR+UPI, EUR+iDEAL).
+  # Used by prepare to honor an INR remount on a USD-listed cart.
+  def self.local_method_quote_enabled?(seller, currency)
+    seller_enabled?(seller) &&
+      FORCED_CURRENCY_PAYMENT_METHODS.any? do |method, forced|
+        forced == currency.to_s.downcase && (stripe_test_mode? || local_method_launched?(method, seller))
+      end
   end
 
   # Own ramp on top of seller_enabled?: a membership amount outlives checkout.
@@ -244,6 +264,26 @@ class Checkout::BuyerCurrencyEligibility
       (destination_charge_quotes_enabled?(seller) &&
         settlement_merchant_account(merchant_account)&.is_managed_by_gumroad?) ||
       false
+  end
+
+  # The forced-currency lane's charge-model gate.
+  #
+  # A seller with a Gumroad-managed Stripe Custom account is charged with a DESTINATION
+  # charge — StripeChargeProcessor creates the PaymentIntent on the Gumroad platform
+  # account and passes their account as `transfer_data[destination]` — which is the same
+  # intent shape as a seller with no Stripe account at all. The two are indistinguishable
+  # from Stripe's point of view, so treating one as unsupported only withheld local
+  # payment methods from checkouts that could complete.
+  #
+  # This gate does not consult the destination-charge ramp flag, unlike the card lane's
+  # supported_charge_model?. This lane has supported destination charges since #1409 and
+  # is already live; the flag exists to ramp the card lane's FX-quote path, which is the
+  # part that was never exercised for this charge model.
+  def self.supported_forced_currency_charge_model?(merchant_account)
+    return false if merchant_account.blank?
+
+    merchant_account.is_a_stripe_connect_account? ||
+      settlement_merchant_account(merchant_account)&.is_managed_by_gumroad? || false
   end
 
   def self.usd_settling_merchant_account?(merchant_account, presentment_currency:, seller: nil)
@@ -368,7 +408,7 @@ class Checkout::BuyerCurrencyEligibility
         self.class.listed_currency_direct_charge_enabled?(seller) &&
         listed_currency_displayed?(buyer_currency) &&
         purchases.none? { Purchase::FixLaterChargePresentmentService.kind_for(_1).present? } &&
-        purchases.none? { _1.tip&.value_cents.to_i.positive? || _1.shipping_cents.to_i.positive? } &&
+        purchases.none? { _1.shipping_cents.to_i.positive? } &&
         listed_lane_rates_uniform?(purchases)
 
       if listed_lane
@@ -520,8 +560,18 @@ class Checkout::BuyerCurrencyEligibility
       if self.class.forced_currency_for(payment_method).present?
         self.class.local_method_launched?(payment_method, seller)
       else
-        self.class.forced_currency_surface_available?(currency: forced_currency, seller:)
+        self.class.forced_currency_surface_available?(currency: forced_currency, seller:) ||
+          quote_bound_card_surface?(forced_currency)
       end
+    end
+
+    # Card/Link on a remounted CAD/GBP/… element: no local method forces that currency,
+    # so the method-forced surface gate is the wrong one. The signed quote is.
+    def quote_bound_card_surface?(currency)
+      return false unless self.class.seller_enabled?(seller)
+      return false if params[:buyer_currency_quote].blank?
+
+      StripeChargeProcessor.charge_minor_units_compatible?(currency)
     end
 
     def usd_settling_merchant_account?(presentment_currency)
@@ -532,24 +582,8 @@ class Checkout::BuyerCurrencyEligibility
       self.class.supported_merchant_account?(merchant_account, seller:)
     end
 
-    # The forced-currency lane's charge-model gate.
-    #
-    # A seller with a Gumroad-managed Stripe Custom account is charged with a DESTINATION
-    # charge — StripeChargeProcessor creates the PaymentIntent on the Gumroad platform
-    # account and passes their account as `transfer_data[destination]` — which is the same
-    # intent shape as a seller with no Stripe account at all. The two are indistinguishable
-    # from Stripe's point of view, so treating one as unsupported only withheld local
-    # payment methods from checkouts that could complete.
-    #
-    # This gate does not consult the destination-charge ramp flag, unlike the card lane's
-    # supported_charge_model?. This lane has supported destination charges since #1409 and
-    # is already live; the flag exists to ramp the card lane's FX-quote path, which is the
-    # part that was never exercised for this charge model.
     def supported_forced_currency_charge_model?
-      return false if merchant_account.blank?
-
-      merchant_account.is_a_stripe_connect_account? ||
-        self.class.settlement_merchant_account(merchant_account)&.is_managed_by_gumroad? || false
+      self.class.supported_forced_currency_charge_model?(merchant_account)
     end
 
     # True when this wallet payment is one the server is willing to price in the buyer's

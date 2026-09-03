@@ -35,13 +35,14 @@ import { ThumbnailEditor } from "$app/components/ProductEdit/ProductTab/Thumbnai
 import { TiersEditor } from "$app/components/ProductEdit/ProductTab/TiersEditor";
 import { VersionsEditor } from "$app/components/ProductEdit/ProductTab/VersionsEditor";
 import { RefundPolicySelector } from "$app/components/ProductEdit/RefundPolicy";
-import { useProductEditContext } from "$app/components/ProductEdit/state";
+import { hasPaidVariantPricing, useProductEditContext } from "$app/components/ProductEdit/state";
 import { ToggleSettingRow } from "$app/components/SettingRow";
 import { TypeSafeOptionSelect } from "$app/components/TypeSafeOptionSelect";
 import { Alert } from "$app/components/ui/Alert";
 import { Fieldset, FieldsetTitle } from "$app/components/ui/Fieldset";
 import { Input } from "$app/components/ui/Input";
 import { Label } from "$app/components/ui/Label";
+import { LinkButton } from "$app/components/ui/LinkButton";
 import { Switch } from "$app/components/ui/Switch";
 import { Textarea } from "$app/components/ui/Textarea";
 
@@ -93,12 +94,9 @@ export const ProductTab = () => {
                     <strong>Your AI product is ready!</strong> Take a moment to check out the product and content tabs.
                     Tweak things and make it your own—this is your time to shine!
                   </div>
-                  <button
-                    className="cursor-pointer self-center underline all-unset"
-                    onClick={() => setShowAiNotification(false)}
-                  >
+                  <LinkButton className="self-center" onClick={() => setShowAiNotification(false)}>
                     close
-                  </button>
+                  </LinkButton>
                 </div>
               </Alert>
             ) : null}
@@ -128,9 +126,7 @@ export const ProductTab = () => {
                   <FieldsetTitle>
                     <Label htmlFor={`${uid}-url`}>URL</Label>
                     <CopyToClipboard text={url}>
-                      <button type="button" className="cursor-pointer font-normal underline all-unset">
-                        Copy URL
-                      </button>
+                      <LinkButton className="font-normal">Copy URL</LinkButton>
                     </CopyToClipboard>
                   </FieldsetTitle>
                   <Input id={`${uid}-url`} type="text" value={url} disabled />
@@ -270,15 +266,7 @@ export const ProductTab = () => {
                         priceCents={product.price_cents}
                         suggestedPriceCents={product.suggested_price_cents}
                         isPWYW={product.customizable_price}
-                        setPriceCents={(priceCents) => {
-                          const hasPaidVariantPrices = product.variants.some(
-                            (v) => "price_difference_cents" in v && (v.price_difference_cents ?? 0) > 0,
-                          );
-                          updateProduct({
-                            price_cents: priceCents,
-                            ...(priceCents === 0 && !hasPaidVariantPrices && { customizable_price: true }),
-                          });
-                        }}
+                        setPriceCents={(priceCents) => updateProduct({ price_cents: priceCents })}
                         setSuggestedPriceCents={(suggestedPriceCents) =>
                           updateProduct({ suggested_price_cents: suggestedPriceCents })
                         }
@@ -307,9 +295,7 @@ export const ProductTab = () => {
                               ("price_difference_cents" in v ? (v.price_difference_cents ?? 0) : 0),
                           ),
                         )}
-                        hasPaidVariants={product.variants.some(
-                          (v) => "price_difference_cents" in v && (v.price_difference_cents ?? 0) > 0,
-                        )}
+                        hasPaidVariants={hasPaidVariantPricing(product)}
                       />
                       {product.native_type === "commission" ? (
                         <p

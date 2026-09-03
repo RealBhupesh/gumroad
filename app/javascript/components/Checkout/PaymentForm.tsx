@@ -64,6 +64,7 @@ import {
   requiresReusablePaymentMethodForCardCollection,
   requiresPayment,
   requiresReusablePaymentMethod,
+  shouldSuppressClientConfirmWallets,
   usePayLabel,
   useState,
 } from "$app/components/Checkout/payment";
@@ -80,6 +81,7 @@ import { Checkbox } from "$app/components/ui/Checkbox";
 import { Fieldset, FieldsetTitle } from "$app/components/ui/Fieldset";
 import { Input } from "$app/components/ui/Input";
 import { Label } from "$app/components/ui/Label";
+import { LinkButton } from "$app/components/ui/LinkButton";
 import { Radio } from "$app/components/ui/Radio";
 import { Select } from "$app/components/ui/Select";
 import { useOnChangeSync } from "$app/components/useOnChange";
@@ -700,6 +702,11 @@ const CreditCardContent = ({
   const useStripePaymentElementClientConfirm = canUseStripePaymentElementClientConfirm(state);
   const usesPaymentElement = useStripePaymentElement || useStripePaymentElementClientConfirm;
   const stripePaymentElementConfig = usesPaymentElement ? state.checkoutPayment.elements_options : null;
+  const suppressClientConfirmWallets = shouldSuppressClientConfirmWallets(state);
+  const paymentElementWalletsEnabled =
+    state.checkoutPayment.payment_element_wallets &&
+    !suppressClientConfirmWallets &&
+    (getStripePaymentElementMountCurrency(state) ?? "usd") === "usd";
 
   // When the Payment Element renders Apple Pay, describe the cart's recurring agreement on the
   // sheet so Apple issues a device-independent merchant token (MPAN) — the exact same declaration
@@ -721,7 +728,7 @@ const CreditCardContent = ({
           products: state.products,
           managementURL: Routes.library_url(),
           requestApplePayMerchantTokens: state.checkoutPayment.request_apple_pay_merchant_tokens,
-          paymentElementWallets: state.checkoutPayment.payment_element_wallets,
+          paymentElementWallets: paymentElementWalletsEnabled,
         })
       : undefined;
   const paymentElementApplePayOptionKey = JSON.stringify(paymentElementApplePayOption ?? null, (key, value: unknown) =>
@@ -890,10 +897,7 @@ const CreditCardContent = ({
           confirmationTokenId: tokenResult.confirmationTokenId,
           cardCountry: tokenResult.cardCountry,
           walletType: tokenResult.wallet?.type ?? null,
-          mountCurrency: assertDefined(
-            stripePaymentElementMountCurrency,
-            "`stripePaymentElementMountCurrency` should be defined when confirming via the Payment Element",
-          ),
+          mountCurrency: controller.mountCurrency,
           // Same config object the Element was mounted from, so the token always describes the
           // mounted method list rather than whatever the current props say.
           methodListToken:
@@ -1113,14 +1117,13 @@ const CreditCardContent = ({
       {stripePaymentElementConfig && !useSavedCard ? (
         <div className="flex flex-col gap-4">
           {state.savedCreditCard && paymentElementReady ? (
-            <button
-              type="button"
-              className="-mt-10 cursor-pointer self-end font-normal underline all-unset"
+            <LinkButton
+              className="-mt-10 self-end font-normal"
               disabled={isProcessing(state)}
               onClick={() => setUseSavedCard(true)}
             >
               Use saved card
-            </button>
+            </LinkButton>
           ) : null}
           <PaymentElementInput
             amount={stripePaymentElementAmount}
@@ -1132,7 +1135,7 @@ const CreditCardContent = ({
                 ? "off_session"
                 : undefined
             }
-            walletsEnabled={state.checkoutPayment.payment_element_wallets}
+            walletsEnabled={paymentElementWalletsEnabled}
             flatLayout={state.checkoutPayment.flat_payment_methods}
             applePayOption={memoizedPaymentElementApplePayOption}
             disabled={isProcessing(state)}
@@ -1643,9 +1646,15 @@ const useStripePaymentRequest = (disabled: boolean) => {
     }
   }, [state.surcharges, shippingAddressChangeEvent]);
 
-  const canPay = paymentMethods && (paymentMethods.googlePay || paymentMethods.applePay);
-  const isGooglePay = paymentMethods?.googlePay ?? false;
-  const isApplePay = paymentMethods?.applePay ?? false;
+  const canPay = !disabled && paymentMethods && (paymentMethods.googlePay || paymentMethods.applePay);
+  const isGooglePay = !disabled && (paymentMethods?.googlePay ?? false);
+  const isApplePay = !disabled && (paymentMethods?.applePay ?? false);
+
+  React.useEffect(() => {
+    if (disabled && state.paymentMethod === "stripePaymentRequest") {
+      dispatch({ type: "set-value", paymentMethod: "card" });
+    }
+  }, [disabled, state.paymentMethod]);
 
   React.useEffect(() => {
     if (!canPay) return;
@@ -1742,12 +1751,15 @@ const PaymentMethodsSection = ({
   isTestPurchase: boolean;
 }) => {
   const [state] = useState();
+  const suppressClientConfirmWallets = shouldSuppressClientConfirmWallets(state);
   // The Payment Request Button is disabled when the Payment Element renders wallets itself
   // (payment_element_wallets — see antiwork/gumroad#5768): showing both would give the buyer two
   // Apple Pay buttons. Carts on the CardElement fallback lane never mount a Payment Element, and
   // the presenter always sends payment_element_wallets: false for them, so they keep the button.
   const { canPay, isGooglePay } = useStripePaymentRequest(
-    state.checkoutPayment.disable_wallets || state.checkoutPayment.payment_element_wallets,
+    state.checkoutPayment.disable_wallets ||
+      state.checkoutPayment.payment_element_wallets ||
+      suppressClientConfirmWallets,
   );
   const [paymentElementReady, setPaymentElementReady] = React.useState(false);
   const handlePaymentElementReadyChange = React.useCallback((ready: boolean) => setPaymentElementReady(ready), []);

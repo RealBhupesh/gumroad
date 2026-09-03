@@ -38,16 +38,15 @@ class HandleEmailEventInfo::ForAbandonedCartEmail
     end
 
     def handle_click_event!(installment)
-      return if email_event_info.click_url_as_mongo_key.blank?
+      return if email_event_info.click_url_as_engagement_key.blank?
 
-      EmailEngagementDynamoStore.record_click(**common_event_attributes(installment), click_url: email_event_info.click_url_as_mongo_key)
+      EmailEngagementDynamoStore.record_click(**common_event_attributes(installment), click_url: email_event_info.click_url_as_engagement_key)
       update_installment_cache(installment, :unique_click_count)
       update_installment_cache(installment, :unique_open_count)
     end
 
     def update_installment_cache(installment, key)
-      installment.invalidate_cache(key)
-      installment.invalidate_legacy_engagement_cache(key)
+      Installment.invalidate_engagement_cache(installment.id, key)
     end
 
     def common_event_attributes(installment)

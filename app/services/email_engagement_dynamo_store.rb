@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
-# Dual-write adapter for the DynamoDB table replacing the CreatorEmailOpenEvent /
-# CreatorEmailClickEvent / CreatorEmailClickSummary Mongo collections.
+# The store for creator email engagement (opens/clicks), on one DynamoDB table.
 #
 # Partition key `pk` (S, the stringified installment id), sort key `sk` (S), one of:
 #   SUMMARY                    — open_count / click_count / click_pair_count counters;
@@ -20,6 +19,12 @@ class EmailEngagementDynamoStore
   SUMMARY_SORT_KEY = "SUMMARY"
   BATCH_GET_LIMIT = 100
   BATCH_GET_MAX_ATTEMPTS = 5
+  TRANSACT_CONFLICT_MAX_ATTEMPTS = 3
+  TRANSACT_CONFLICT_BACKOFF = 0.02
+  # Reasons that leave a transaction worth retrying in place. A throttle or
+  # validation reason means DynamoDB is rejecting the transact for a reason a
+  # retry will not clear, so it must raise for Sidekiq's own backoff instead.
+  RETRYABLE_CANCELLATION_CODES = ["ConditionalCheckFailed", "TransactionConflict", "None"].freeze
 
   class << self
     attr_writer :client
@@ -129,8 +134,8 @@ class EmailEngagementDynamoStore
       )
     end
 
-    # The backfill must derive identical keys from the Mongo documents, so key
-    # derivation is public and must not change while Mongo remains around.
+    # Key derivation is public because the historical data was backfilled with
+    # these exact digests; changing it would orphan every existing item.
     def partition_key(installment_id)
       installment_id.to_i.to_s
     end
@@ -175,7 +180,7 @@ class EmailEngagementDynamoStore
       end
 
       # Creates the open item only if absent, without touching an existing item's
-      # open_count, mirroring the Mongo compensating-open behavior on clicks.
+      # open_count: a click implies an open even when no open event arrived.
       # Bundled with the summary increment so a retry cannot leave unique opens undercounted.
       def ensure_open_item(installment_id:, mailer_method:, mailer_args:)
         now = timestamp
@@ -265,22 +270,47 @@ class EmailEngagementDynamoStore
         }
       end
 
+      # Every open and click for one post increments that post's single SUMMARY item, so a
+      # callback burst contends on it. Conflicts clear in milliseconds, but raising sends the
+      # whole event back to Sidekiq, which re-runs the MySQL half too and pushes the retry
+      # onto the queue depth that scales the worker fleet. Absorb them here instead.
       def transact_unless_exists(transact_items)
-        client.transact_write_items(transact_items:)
-        true
-      rescue Aws::DynamoDB::Errors::TransactionCanceledException => e
-        raise unless conditional_check_failed?(e)
-        false
+        attempts = 0
+        begin
+          client.transact_write_items(transact_items:)
+          true
+        rescue Aws::DynamoDB::Errors::TransactionCanceledException => e
+          return false if conditional_check_failed?(e)
+          raise unless transaction_conflict?(e)
+
+          attempts += 1
+          raise if attempts >= TRANSACT_CONFLICT_MAX_ATTEMPTS
+          # Jittered so contending writers don't line up again on the next attempt.
+          sleep(rand * TRANSACT_CONFLICT_BACKOFF * 2**(attempts - 1))
+          retry
+        end
       end
 
       # A cancellation is the expected duplicate only when fully explained by
-      # condition checks; anything else (conflict, throttle) raises so Sidekiq
-      # retries the event. Stubbed clients raise with empty data, so fall back
-      # to the per-item reason list the service embeds in the message.
+      # condition checks; a throttle or validation failure still raises so Sidekiq
+      # retries the event.
       def conditional_check_failed?(error)
-        codes = error.data.try(:cancellation_reasons).to_a.map(&:code)
-        codes = error.message.to_s[/\[([^\]]+)\]\z/, 1].to_s.split(",").map(&:strip) if codes.empty?
+        codes = cancellation_codes(error)
         codes.any? && codes.all? { |code| ["ConditionalCheckFailed", "None"].include?(code) }
+      end
+
+      def transaction_conflict?(error)
+        codes = cancellation_codes(error)
+        codes.include?("TransactionConflict") &&
+          codes.all? { |code| RETRYABLE_CANCELLATION_CODES.include?(code) }
+      end
+
+      # Stubbed clients raise with empty data, so fall back to the per-item reason
+      # list the service embeds in the message.
+      def cancellation_codes(error)
+        codes = error.data.try(:cancellation_reasons).to_a.map(&:code)
+        return codes if codes.any?
+        error.message.to_s[/\[([^\]]+)\]\z/, 1].to_s.split(",").map(&:strip)
       end
 
       def item_key(installment_id, sort_key)
