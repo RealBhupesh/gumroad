@@ -3986,6 +3986,30 @@ class SubscriptionTest < ActiveSupport::TestCase
     assert_equal 900, @subscription.current_subscription_price_cents
   end
 
+  test "#discount_applies_to_next_charge? ignores mid-cycle upgrade charges" do
+    limited_duration_offer_code_context
+    @purchase.purchase_offer_code_discount.update!(duration_in_billing_cycles: 2)
+    @purchase.update_flag!(:is_archived_original_subscription_purchase, true, true)
+    create_purchase(
+      link: @subscription.link,
+      subscription: @subscription,
+      is_original_subscription_purchase: true,
+      is_updated_original_subscription_purchase: true,
+      purchase_state: "not_charged",
+      succeeded_at: nil
+    )
+    create_purchase(
+      link: @subscription.link,
+      subscription: @subscription,
+      is_upgrade_purchase: true,
+      price_cents: 750
+    )
+    @subscription.reload
+
+    assert_equal true, @subscription.discount_applies_to_next_charge?
+    assert_equal 900, @subscription.current_subscription_price_cents
+  end
+
   def installment_plan_price_context
     @ip_product = create_product(name: "Awesome product", user: @seller, price_cents: 1000)
     create_product_installment_plan(link: @ip_product, number_of_installments: 3)
