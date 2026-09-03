@@ -425,9 +425,9 @@ class Payouts
     end
   end
 
-  def self.create_payment(date, processor_type, user, payout_type: Payouts::PAYOUT_TYPE_STANDARD)
+  def self.create_payment(date, processor_type, user, payout_type: Payouts::PAYOUT_TYPE_STANDARD, balances: nil)
     payout_processor = ::PayoutProcessorType.get(processor_type)
-    balances = mark_balances_processing(date, processor_type, user)
+    balances = mark_balances_processing(date, processor_type, user, balances:)
     balance_cents = balances.sum(&:amount_cents)
 
     if balance_cents <= 0
@@ -458,10 +458,14 @@ class Payouts
     [payment, payment_errors]
   end
 
-  def self.mark_balances_processing(date, processor_type, user)
+  def self.mark_balances_processing(date, processor_type, user, balances: nil)
     payout_processor = ::PayoutProcessorType.get(processor_type)
-    payable_balances = user.unpaid_balances_up_to_date(date).select do |balance|
-      payout_processor.is_balance_payable(balance)
+    payable_balances = if balances
+      balances.select { |balance| payout_processor.is_balance_payable(balance) }
+    else
+      user.unpaid_balances_up_to_date(date).select do |balance|
+        payout_processor.is_balance_payable(balance)
+      end
     end
 
     if payout_processor.respond_to?(:filter_aggregate_payable_balances)

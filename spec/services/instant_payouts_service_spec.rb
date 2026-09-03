@@ -197,5 +197,39 @@ describe InstantPayoutsService, :vcr do
         expect(result).to eq(success: false, error: "Failed to process instant payout")
       end
     end
+
+    context "when same-date balances together exceed the instant payout cap" do
+      let(:payment) { build(:payment_completed) }
+
+      before do
+        allow_any_instance_of(User).to receive(:eligible_for_instant_payouts?).and_return(true)
+        allow(StripePayoutProcessor).to receive(:instantly_payable_amount_cents_on_stripe).and_return(12_000_00)
+        allow_any_instance_of(User).to receive(:instant_payouts_supported?).and_return(true)
+        allow(StripePayoutProcessor).to receive(:process_payments)
+      end
+
+      it "creates a separate payment per batch instead of claiming both balances by date" do
+        first = create(:balance, holding_amount_cents: 6000_00, user: seller, date: Date.yesterday)
+        second = create(:balance, holding_amount_cents: 6000_00, user: seller, date: Date.yesterday)
+
+        expect(Payouts).to receive(:create_payment).with(
+          Date.yesterday,
+          PayoutProcessorType::STRIPE,
+          seller,
+          payout_type: Payouts::PAYOUT_TYPE_INSTANT,
+          balances: [first]
+        ).and_return([payment, []])
+        expect(Payouts).to receive(:create_payment).with(
+          Date.yesterday,
+          PayoutProcessorType::STRIPE,
+          seller,
+          payout_type: Payouts::PAYOUT_TYPE_INSTANT,
+          balances: [second]
+        ).and_return([payment, []])
+
+        result = described_class.new(seller).perform
+        expect(result[:success]).to be true
+      end
+    end
   end
 end

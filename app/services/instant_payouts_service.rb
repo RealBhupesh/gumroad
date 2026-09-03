@@ -13,7 +13,7 @@ class InstantPayoutsService
 
     balances = seller.instantly_payable_unpaid_balances
       .filter { |balance| balance.date <= date }
-      .sort_by(&:created_at)
+      .sort_by { |balance| [balance.date, balance.created_at, balance.id] }
     return { success: false, error: "You need at least $1 in settled balance to request an instant payout." } if balances.sum(&:holding_amount_cents) < StripePayoutProcessor::MINIMUM_INSTANT_PAYOUT_AMOUNT_CENTS
 
     if balances.any? { |balance| balance.holding_amount_cents > StripePayoutProcessor::MAXIMUM_INSTANT_PAYOUT_AMOUNT_CENTS }
@@ -31,7 +31,11 @@ class InstantPayoutsService
           batch.last.date,
           PayoutProcessorType::STRIPE,
           seller,
-          payout_type: Payouts::PAYOUT_TYPE_INSTANT
+          payout_type: Payouts::PAYOUT_TYPE_INSTANT,
+          # create_payment(date) claims every unpaid balance through that date.
+          # Instant payouts already split locally under Stripe's $9,999 cap, so
+          # same-date rows must stay in their own batch.
+          balances: batch
         )
 
         if payment.present? && payment_errors.blank?
