@@ -3,6 +3,8 @@
 require "omniauth-apple"
 require "omniauth-twitter"
 require "omniauth-google-oauth2"
+require_relative "../../lib/omni_auth/strategies/youtube"
+require_relative "../../lib/omni_auth/strategies/instagram"
 
 # Use this hook to configure devise mailer, warden hooks and so forth.
 # Many of these configuration options can be set straight in your model.
@@ -277,6 +279,15 @@ Devise.setup do |config|
                   GOOGLE_CLIENT_ID,
                   GOOGLE_CLIENT_SECRET,
                   scope: "email,profile"
+
+  # YouTube connect only — does not change Google login scopes.
+  config.omniauth :youtube,
+                  GOOGLE_CLIENT_ID,
+                  GOOGLE_CLIENT_SECRET
+
+  config.omniauth :instagram,
+                  INSTAGRAM_APP_ID,
+                  INSTAGRAM_APP_SECRET
 
   config.omniauth :apple,
                   APPLE_CLIENT_ID,

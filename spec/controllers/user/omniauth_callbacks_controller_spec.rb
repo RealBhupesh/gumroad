@@ -587,4 +587,164 @@ describe User::OmniauthCallbacksController do
       end
     end
   end
+
+  describe "#youtube" do
+    let(:user) { create(:user) }
+    let(:channel) do
+      {
+        "id" => "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "handle" => "googledevelopers",
+        "published_at" => "2007-08-23T00:34:43Z",
+        "subscriber_count" => "2400000",
+        "video_count" => "5800",
+        "last_posted_at" => Time.iso8601("2026-08-01T12:00:00Z"),
+      }
+    end
+
+    before do
+      OmniAuth.config.mock_auth[:youtube] = OmniAuth::AuthHash.new fetch_json("google").merge("provider" => "youtube")
+      request.env["omniauth.auth"] = OmniAuth.config.mock_auth[:youtube]
+    end
+
+    it "records the YouTube channel on a signed-in user" do
+      Feature.activate_user(:youtube_connect, user)
+      allow(controller).to receive(:logged_in_user).and_return(user)
+      allow(YoutubeChannelFetcher).to receive(:new).and_return(instance_double(YoutubeChannelFetcher, fetch: channel))
+
+      post :youtube
+
+      expect(response).to redirect_to profile_path
+      identity = user.reload.youtube_identity
+      expect(identity.channel_id).to eq("UC_x5XG1OV2P6uZZ5FSM9Ttw")
+      expect(identity.handle).to eq("googledevelopers")
+      expect(user.social_connect_verifications.find_by!(platform: "youtube").uid).to eq("UC_x5XG1OV2P6uZZ5FSM9Ttw")
+    end
+
+    it "redirects to login when no user is signed in" do
+      allow(controller).to receive(:logged_in_user).and_return(nil)
+
+      post :youtube
+
+      expect(response).to redirect_to login_path
+      expect(flash[:alert]).to eq "You need to be logged in to link your YouTube account."
+    end
+
+    it "does not create a user from a YouTube connect" do
+      Feature.activate_user(:youtube_connect, user)
+      allow(controller).to receive(:logged_in_user).and_return(user)
+      allow(YoutubeChannelFetcher).to receive(:new).and_return(instance_double(YoutubeChannelFetcher, fetch: channel))
+
+      expect { post :youtube }.not_to change { User.count }
+    end
+
+    it "does not connect when the youtube_connect flag is off" do
+      allow(controller).to receive(:logged_in_user).and_return(user)
+      fetcher = instance_double(YoutubeChannelFetcher)
+      allow(YoutubeChannelFetcher).to receive(:new).and_return(fetcher)
+
+      post :youtube
+
+      expect(YoutubeChannelFetcher).not_to have_received(:new)
+      expect(user.reload.youtube_identity).to be_nil
+      expect(flash[:alert]).to eq "YouTube connect is not available."
+      expect(response).to redirect_to profile_path
+    end
+
+    it "does not 500 when the channel fetch raises" do
+      Feature.activate_user(:youtube_connect, user)
+      allow(controller).to receive(:logged_in_user).and_return(user)
+      fetcher = instance_double(YoutubeChannelFetcher)
+      allow(YoutubeChannelFetcher).to receive(:new).and_return(fetcher)
+      allow(fetcher).to receive(:fetch).and_raise(Errno::ECONNRESET)
+
+      post :youtube
+
+      expect(response).to redirect_to profile_path
+      expect(flash[:alert]).to eq "Couldn't read a YouTube channel for that Google account."
+      expect(user.reload.youtube_identity).to be_nil
+    end
+  end
+
+  describe "#instagram" do
+    let(:user) { create(:user) }
+    let(:profile) do
+      {
+        "user_id" => "17841400000000000",
+        "username" => "gumroad",
+        "followers_count" => 250_000,
+        "media_count" => 1_200,
+        "last_posted_at" => "2026-09-01T12:00:00Z",
+      }
+    end
+
+    before do
+      OmniAuth.config.mock_auth[:instagram] = OmniAuth::AuthHash.new(
+        provider: "instagram",
+        uid: profile["user_id"],
+        credentials: { token: "instagram-token" },
+      )
+      request.env["omniauth.auth"] = OmniAuth.config.mock_auth[:instagram]
+    end
+
+    it "records the Instagram account on a signed-in user" do
+      Feature.activate_user(:instagram_connect, user)
+      allow(controller).to receive(:logged_in_user).and_return(user)
+      allow(InstagramProfileFetcher).to receive(:new).and_return(instance_double(InstagramProfileFetcher, fetch: profile))
+
+      post :instagram
+
+      expect(response).to redirect_to profile_path
+      identity = user.reload.instagram_identity
+      expect(identity.instagram_user_id).to eq("17841400000000000")
+      expect(identity.handle).to eq("gumroad")
+      expect(user.social_connect_verifications.find_by!(platform: "instagram")).to have_attributes(
+        uid: "17841400000000000",
+        handle: "gumroad",
+      )
+    end
+
+    it "redirects to login when no user is signed in" do
+      allow(controller).to receive(:logged_in_user).and_return(nil)
+
+      post :instagram
+
+      expect(response).to redirect_to login_path
+      expect(flash[:alert]).to eq "You need to be logged in to link your Instagram account."
+    end
+
+    it "does not connect when the instagram_connect flag is off" do
+      allow(controller).to receive(:logged_in_user).and_return(user)
+
+      post :instagram
+
+      expect(user.social_connect_verifications.find_by(platform: "instagram")).to be_nil
+      expect(user.reload.instagram_identity).to be_nil
+      expect(flash[:alert]).to eq "Instagram connect is not available."
+      expect(response).to redirect_to profile_path
+    end
+  end
+
+  describe "#failure" do
+    it "redirects YouTube OAuth failures to profile instead of payments settings" do
+      user = create(:user)
+      allow(controller).to receive(:logged_in_user).and_return(user)
+      request.env["omniauth.error.strategy"] = instance_double(OmniAuth::Strategies::Youtube, name: "youtube")
+
+      get :failure, params: { error: "access_denied" }
+
+      expect(response).to redirect_to profile_path
+      expect(flash[:alert]).to eq "Couldn't connect YouTube. Please try again."
+    end
+
+    it "redirects Instagram OAuth failures to profile" do
+      user = create(:user)
+      allow(controller).to receive(:logged_in_user).and_return(user)
+      request.env["omniauth.error.strategy"] = instance_double(OmniAuth::Strategies::Instagram, name: "instagram")
+
+      get :failure, params: { error: "access_denied" }
+
+      expect(response).to redirect_to profile_path
+      expect(flash[:alert]).to eq "Couldn't connect Instagram. Please try again."
+    end
+  end
 end

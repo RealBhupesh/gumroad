@@ -593,6 +593,12 @@ Rails.application.routes.draw do
                path_names: { password: "forgot_password" })
 
     devise_scope :user do
+      # OmniAuth otherwise only invokes #failure via middleware. A real route
+      # lets the YouTube deny-path (and its controller spec) hit the action.
+      match "/users/auth/failure",
+            to: "user/omniauth_callbacks#failure",
+            via: [:get, :post]
+
       get "signup", to: "signup#new", as: :signup
       post "signup", to: "signup#create"
       post "save_to_library", to: "signup#save_to_library", as: :save_to_library
@@ -619,6 +625,10 @@ Rails.application.routes.draw do
         end
       end
     end
+
+    post "/instagram/deauthorize", to: "instagram_callbacks#deauthorize", as: :instagram_deauthorize
+    post "/instagram/data_deletion", to: "instagram_callbacks#data_deletion", as: :instagram_data_deletion
+    get "/instagram/data_deletion/:confirmation_code", to: "instagram_callbacks#data_deletion_status", as: :instagram_data_deletion_status
 
     namespace :sellers do
       resource "switch", only: :create, controller: "switch"
@@ -696,6 +706,8 @@ Rails.application.routes.draw do
       resource :connections, only: [] do
         member do
           post :unlink_twitter
+          post :unlink_youtube
+          post :unlink_instagram
         end
       end
     end

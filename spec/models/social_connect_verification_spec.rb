@@ -79,4 +79,77 @@ describe SocialConnectVerification do
       expect(verification.account_created_at).to be_nil
     end
   end
+
+  describe ".record_from_youtube!" do
+    let(:user) { create(:user) }
+    let(:channel) do
+      {
+        "id" => "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        "handle" => "googledevelopers",
+        "published_at" => "2007-08-23T00:34:43Z",
+        "subscriber_count" => "2400000",
+        "video_count" => "5800",
+        "last_posted_at" => Time.iso8601("2026-08-01T12:00:00Z"),
+      }
+    end
+
+    it "stores verified channel metadata" do
+      verification = described_class.record_from_youtube!(user, channel)
+
+      expect(verification.reload).to have_attributes(
+        platform: "youtube",
+        uid: "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        handle: "googledevelopers",
+        follower_count: 2_400_000,
+        post_count: 5_800,
+      )
+      expect(verification.account_created_at).to eq(Time.iso8601("2007-08-23T00:34:43Z"))
+      expect(verification.last_posted_at).to eq(Time.iso8601("2026-08-01T12:00:00Z"))
+    end
+
+    it "records nothing when the channel id is missing" do
+      expect do
+        described_class.record_from_youtube!(user, channel.merge("id" => ""))
+      end.not_to change { described_class.count }
+    end
+  end
+
+  describe ".record_from_instagram!" do
+    let(:user) { create(:user) }
+    let(:profile) do
+      {
+        "user_id" => "17841400000000000",
+        "username" => "gumroad",
+        "followers_count" => 250_000,
+        "media_count" => 1_200,
+        "last_posted_at" => "2026-09-01T12:00:00Z",
+      }
+    end
+
+    it "stores verified professional-account metadata" do
+      verification = described_class.record_from_instagram!(user, profile)
+
+      expect(verification.reload).to have_attributes(
+        platform: "instagram",
+        uid: "17841400000000000",
+        handle: "gumroad",
+        account_created_at: nil,
+        follower_count: 250_000,
+        post_count: 1_200,
+        last_posted_at: Time.iso8601("2026-09-01T12:00:00Z"),
+      )
+    end
+
+    it "prefers the app-scoped token user id so deauthorize callbacks can match" do
+      verification = described_class.record_from_instagram!(user, profile.merge("token_user_id" => "998877"))
+
+      expect(verification.reload.uid).to eq("998877")
+    end
+
+    it "records nothing when the user id is missing" do
+      expect do
+        described_class.record_from_instagram!(user, profile.except("user_id"))
+      end.not_to change { described_class.count }
+    end
+  end
 end

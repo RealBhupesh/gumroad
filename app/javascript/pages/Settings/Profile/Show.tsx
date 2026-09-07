@@ -1,10 +1,15 @@
-import { FontFamily, TwitterX } from "@boxicons/react";
+import { FontFamily, Instagram, TwitterX, Youtube } from "@boxicons/react";
 import { Link, router, usePage } from "@inertiajs/react";
 import { isEqual } from "lodash-es";
 import * as React from "react";
 import typia from "typia";
 
-import { updateProfileSettings as saveProfileSettings, unlinkTwitter } from "$app/data/profile_settings";
+import {
+  updateProfileSettings as saveProfileSettings,
+  unlinkInstagram,
+  unlinkTwitter,
+  unlinkYoutube,
+} from "$app/data/profile_settings";
 import {
   ProfileSettingsForm,
   changedProfileSettings,
@@ -68,6 +73,12 @@ type ProfilePageProps = {
   editable_profile: ProfileEditorProps;
   profile_version: string;
   custom_html_pages_enabled: boolean;
+  youtube_connect_enabled: boolean;
+  youtube_connected: boolean;
+  youtube_handle: string | null;
+  instagram_connect_enabled: boolean;
+  instagram_connected: boolean;
+  instagram_handle: string | null;
   has_custom_landing_page: boolean;
   seller_fonts_css_source: string;
   username: string;
@@ -81,6 +92,12 @@ export default function SettingsPage() {
     editable_profile,
     profile_version,
     custom_html_pages_enabled,
+    youtube_connect_enabled,
+    youtube_connected,
+    youtube_handle,
+    instagram_connect_enabled,
+    instagram_connected,
+    instagram_handle,
     has_custom_landing_page,
     seller_fonts_css_source,
     username,
@@ -258,6 +275,26 @@ export default function SettingsPage() {
   const handleUnlinkTwitter = asyncVoid(async () => {
     try {
       await unlinkTwitter();
+      router.reload();
+    } catch (e) {
+      assertResponseError(e);
+      showAlert(e.message, "error");
+    }
+  });
+
+  const handleUnlinkYoutube = asyncVoid(async () => {
+    try {
+      await unlinkYoutube();
+      router.reload();
+    } catch (e) {
+      assertResponseError(e);
+      showAlert(e.message, "error");
+    }
+  });
+
+  const handleUnlinkInstagram = asyncVoid(async () => {
+    try {
+      await unlinkInstagram();
       router.reload();
     } catch (e) {
       assertResponseError(e);
@@ -500,6 +537,28 @@ export default function SettingsPage() {
                       Connect to X
                     </SocialAuthButton>
                   )}
+                  {youtube_connected ? (
+                    <Button type="button" color="youtube" onClick={handleUnlinkYoutube}>
+                      <Youtube pack="brands" className="size-5" />
+                      Disconnect {youtube_handle ? `${youtube_handle} from YouTube` : "YouTube"}
+                    </Button>
+                  ) : youtube_connect_enabled ? (
+                    <SocialAuthButton provider="youtube" href={Routes.user_youtube_omniauth_authorize_path()}>
+                      <Youtube pack="brands" className="size-5" />
+                      Connect to YouTube
+                    </SocialAuthButton>
+                  ) : null}
+                  {instagram_connected ? (
+                    <Button type="button" color="instagram" onClick={handleUnlinkInstagram}>
+                      <Instagram pack="brands" className="size-5" />
+                      Disconnect {instagram_handle ? `${instagram_handle} from Instagram` : "Instagram"}
+                    </Button>
+                  ) : instagram_connect_enabled ? (
+                    <SocialAuthButton provider="instagram" href={Routes.user_instagram_omniauth_authorize_path()}>
+                      <Instagram pack="brands" className="size-5" />
+                      Connect to Instagram
+                    </SocialAuthButton>
+                  ) : null}
                 </Fieldset>
               ) : null}
             </section>

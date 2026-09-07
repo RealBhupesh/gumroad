@@ -194,6 +194,62 @@ describe Api::V2::LinksController do
         expect(cover_blob_queries.count).to eq(1)
         expect(cover_blob_queries.first).to include("IN (")
       end
+
+      it "batch loads associations used to serialize products" do
+        global_custom_field = create(:custom_field, seller: @user, global: true)
+        membership = create(:membership_product_with_preset_tiered_pricing, user: @user, name: "Membership", created_at: Time.current + 7200)
+        product_custom_fields = [@product1, @product2].index_with do |product|
+          create(:custom_field, seller: @user, name: "Field for #{product.name}").tap { product.custom_fields << _1 }
+        end
+        [@product1, @product2].each do |product|
+          create(:product_file, link: product)
+          category = create(:variant_category, link: product)
+          create(:variant, variant_category: category, price_difference_cents: 100)
+        end
+        create(:thumbnail, product: @product1)
+        create(:thumbnail, product: @product2)
+
+        queries = []
+        counter = lambda do |*, payload|
+          queries << payload[:sql] unless payload[:name] == "SCHEMA"
+        end
+
+        ActiveSupport::Notifications.subscribed(counter, "sql.active_record") do
+          get @action, params: @params
+        end
+
+        expect(response).to be_successful
+        products_by_id = response.parsed_body["products"].index_by { _1["id"] }
+        [@product1, @product2].each do |product|
+          custom_field_ids = products_by_id.fetch(product.external_id).fetch("custom_fields").pluck("id")
+          expect(custom_field_ids).to contain_exactly(global_custom_field.external_id, product_custom_fields.fetch(product).external_id)
+        end
+
+        membership_json = products_by_id.fetch(membership.external_id)
+        expect(membership_json.fetch("is_tiered_membership")).to eq(true)
+        expect(membership_json.fetch("recurrences")).to include("monthly")
+
+        # Product-level alive_prices + one batched variant/tier alive_prices preload.
+        # Membership must reuse that variant tree (not extra tiers/default_tier price loads,
+        # and not per-product prices.alive.is_buy during recurrence serialization).
+        price_queries = queries.grep(/FROM `prices`/)
+        expect(price_queries.count).to eq(2)
+        expect(price_queries.count { _1.include?("IN (") }).to eq(2)
+        expect(queries.grep(/FROM `thumbnails`/).count).to eq(1)
+        expect(queries.grep(/FROM `product_files`/).count).to eq(1)
+        # Global + product-scoped preloads are two queries; some runs combine them into one.
+        expect(queries.grep(/FROM `custom_fields`/).count).to be_between(1, 2)
+        expect(queries.grep(/MIN\(`base_variants`\.`price_difference_cents`\)/)).to be_empty
+
+        thumbnail_attachment_queries = queries.grep(/FROM `active_storage_attachments`.*Thumbnail/)
+        expect(thumbnail_attachment_queries.count { _1.include?("IN (") }).to be >= 1
+        expect(queries.grep(/FROM `active_storage_blobs`/).count { _1.include?("IN (") }).to be >= 1
+        # Deep thumbnail preload batches variant_records so Thumbnail#url does not look them up per product.
+        variant_record_queries = queries.grep(/FROM `active_storage_variant_records`/)
+        expect(variant_record_queries).not_to be_empty
+        expect(variant_record_queries.count).to eq(1)
+        expect(variant_record_queries.first).to include("IN (")
+      end
     end
   end
 
@@ -226,8 +282,8 @@ describe Api::V2::LinksController do
         expect(product.name).to eq("Some product")
         expect(product.price_cents).to eq(200)
         expect(product.native_type).to eq("digital")
-        expect(product.draft).to be true
-        expect(product.purchase_disabled_at).to be_present
+        expect(product.draft).to be false
+        expect(product.purchase_disabled_at).to be_nil
         expect(product.display_product_reviews).to be true
       end
 
@@ -388,12 +444,113 @@ describe Api::V2::LinksController do
         expect(response.parsed_body["message"]).to be_present
       end
 
-      it "starts as a draft with purchase_disabled_at set" do
+      it "publishes the product by default, even with no files or rich content" do
         post @action, params: @params
+
+        product = @user.links.last
+        expect(product.alive_product_files).to be_empty
+        expect(product.has_content?).to be false
+        expect(product.draft).to be false
+        expect(product.purchase_disabled_at).to be_nil
+        expect(response.parsed_body["product"]["published"]).to be true
+        expect(response.parsed_body).not_to have_key("warning")
+      end
+
+      it "keeps the product as a draft when draft is true" do
+        post @action, params: @params.merge(draft: "true")
 
         product = @user.links.last
         expect(product.draft).to be true
         expect(product.purchase_disabled_at).to be_present
+        expect(response.parsed_body["product"]["published"]).to be false
+        expect(response.parsed_body).not_to have_key("warning")
+      end
+
+      it "keeps the product as a draft when published is false" do
+        post @action, params: @params.merge(published: "false")
+
+        product = @user.links.last
+        expect(product.draft).to be true
+        expect(product.purchase_disabled_at).to be_present
+      end
+
+      it "publishes when draft is false" do
+        post @action, params: @params.merge(draft: "false")
+
+        expect(@user.links.last.draft).to be false
+      end
+
+      it "saves a draft with a warning when publishing is blocked" do
+        @user.update!(confirmed_at: nil)
+
+        expect do
+          post @action, params: @params
+        end.to change { @user.links.count }.by(1)
+
+        expect(response).to be_successful
+        body = response.parsed_body
+        expect(body["success"]).to be true
+        expect(body["product"]["published"]).to be false
+        expect(body["warning"]).to eq("Saved as a draft: You have to confirm your email address before you can do that.")
+
+        product = @user.links.last
+        expect(product.draft).to be true
+        expect(product.purchase_disabled_at).to be_present
+      end
+
+      it "saves a draft with a warning when the seller has no payout method" do
+        @user.update!(payment_address: nil)
+
+        post @action, params: @params
+
+        expect(response.parsed_body["success"]).to be true
+        expect(response.parsed_body["warning"]).to start_with("Saved as a draft: ")
+        expect(@user.links.last.draft).to be true
+      end
+
+      it "saves a draft with a warning when content moderation blocks publishing" do
+        allow(ContentModeration::ModerateRecordService).to receive(:check)
+          .and_return(ContentModeration::ModerateRecordService::CheckResult.new(passed: false, reasons: ["Matched blocked word: forbidden"]))
+
+        expect do
+          post @action, params: @params
+        end.to change { @user.links.count }.by(1)
+
+        body = response.parsed_body
+        expect(body["success"]).to be true
+        expect(body["product"]["published"]).to be false
+        expect(body["warning"]).to start_with("Saved as a draft: ")
+        expect(body["warning"]).to include("content guidelines")
+
+        product = @user.links.last
+        expect(product.draft).to be true
+        expect(product.purchase_disabled_at).to be_present
+      end
+
+      it "notifies and keeps the draft when publishing raises unexpectedly" do
+        allow_any_instance_of(Link).to receive(:publish!).and_raise(StandardError, "boom")
+        expect(ErrorNotifier).to receive(:notify).with(instance_of(StandardError), product_id: kind_of(Integer))
+
+        post @action, params: @params
+
+        expect(response.parsed_body["success"]).to be true
+        expect(response.parsed_body["warning"]).to include("Saved as a draft: publishing failed")
+        expect(@user.links.last.draft).to be true
+      end
+
+      it "reports the product as published when a post-publish step raises after the row is live" do
+        allow_any_instance_of(Link).to receive(:publish!) do |product|
+          product.update_columns(draft: false, purchase_disabled_at: nil)
+          raise StandardError, "after_commit boom"
+        end
+        expect(ErrorNotifier).to receive(:notify).with(instance_of(StandardError), product_id: kind_of(Integer))
+
+        post @action, params: @params
+
+        expect(response.parsed_body["success"]).to be true
+        expect(response.parsed_body["product"]["published"]).to be true
+        expect(response.parsed_body["warning"]).to eq("Published, but a post-publish step failed and has been reported.")
+        expect(@user.links.last.draft).to be false
       end
 
       it "saves tags correctly" do
@@ -794,7 +951,7 @@ describe Api::V2::LinksController do
         expect(body["product"]).to be_present
         expect(body["product"]["name"]).to eq("Some product")
         expect(body["product"]["price"]).to eq(200)
-        expect(body["product"]["published"]).to be false
+        expect(body["product"]["published"]).to be true
       end
     end
 

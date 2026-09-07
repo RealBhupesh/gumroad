@@ -53,4 +53,33 @@ describe ConnectionsController do
       expect(response.body).to eq({ success: false, error_message: "Failed to unlink Twitter" }.to_json)
     end
   end
+
+  describe "POST unlink_youtube" do
+    before do
+      create(:user_youtube_identity, user: seller, channel_id: "UC123", handle: "creator")
+    end
+
+    it "clears the live youtube identity and keeps the verification row" do
+      verification = create(:social_connect_verification, user: seller, platform: "youtube", uid: "UC123", handle: "creator")
+
+      post :unlink_youtube
+
+      expect(response.body).to eq({ success: true }.to_json)
+      expect(seller.reload.youtube_identity).to be_nil
+      expect(SocialConnectVerification.exists?(id: verification.id)).to be(true)
+    end
+  end
+
+  describe "POST unlink_instagram" do
+    it "clears the live Instagram identity and keeps the verification row" do
+      create(:user_instagram_identity, user: seller, instagram_user_id: "17841400000000000", handle: "gumroad")
+      verification = create(:social_connect_verification, user: seller, platform: "instagram", uid: "17841400000000000", handle: "gumroad")
+
+      post :unlink_instagram
+
+      expect(response.body).to eq({ success: true }.to_json)
+      expect(seller.reload.instagram_identity).to be_nil
+      expect(SocialConnectVerification.exists?(id: verification.id)).to be(true)
+    end
+  end
 end

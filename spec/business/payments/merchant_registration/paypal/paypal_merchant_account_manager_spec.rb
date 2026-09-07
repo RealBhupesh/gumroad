@@ -254,6 +254,97 @@ describe PaypalMerchantAccountManager, :vcr do
       end
     end
 
+    context "when the PayPal OAuth grant belongs to another partner" do
+      let(:creator) { create(:user) }
+      let(:paypal_merchant_id) { "GSQ5PDPXZCWGW" }
+      let(:oauth_integrations) do
+        [{
+          "integration_type" => "OAUTH_THIRD_PARTY",
+          "integration_method" => "PAYPAL",
+          "oauth_third_party" => [{ "partner_client_id" => "another-partner-client-id" }]
+        }]
+      end
+
+      before do
+        allow_any_instance_of(MerchantAccount).to receive(:paypal_account_details).and_return(
+          "country" => "US",
+          "primary_currency" => "USD",
+          "primary_email_confirmed" => true,
+          "payments_receivable" => true,
+          "primary_email" => "seller@example.com",
+          "oauth_integrations" => oauth_integrations
+        )
+      end
+
+      it "leaves the account incomplete" do
+        result = subject.update_merchant_account(user: creator, paypal_merchant_id:)
+
+        expect(result).to eq("Your PayPal account connect with Gumroad is incomplete because of missing permissions. Please try connecting again and grant the requested permissions.")
+        expect(creator.merchant_accounts.charge_processor_verified.paypal).to be_empty
+        expect(creator.reload.paypal_connect_account).to be_nil
+      end
+
+      it "accepts Gumroad's grant when it follows another partner's grant" do
+        oauth_integrations.first["oauth_third_party"] << { "partner_client_id" => PAYPAL_PARTNER_CLIENT_ID }
+
+        result = subject.update_merchant_account(user: creator, paypal_merchant_id:)
+
+        expect(result).to eq("You have successfully connected your PayPal account with Gumroad.")
+        expect(creator.merchant_accounts.charge_processor_verified.paypal.count).to eq(1)
+      end
+
+      it "accepts Gumroad's grant when it is in a later integration" do
+        oauth_integrations << {
+          "integration_type" => "OAUTH_THIRD_PARTY",
+          "integration_method" => "PAYPAL",
+          "oauth_third_party" => [{ "partner_client_id" => PAYPAL_PARTNER_CLIENT_ID }]
+        }
+
+        result = subject.update_merchant_account(user: creator, paypal_merchant_id:)
+
+        expect(result).to eq("You have successfully connected your PayPal account with Gumroad.")
+        expect(creator.merchant_accounts.charge_processor_verified.paypal.count).to eq(1)
+      end
+
+      it "treats a partial OAuth integration as incomplete" do
+        oauth_integrations.first.delete("oauth_third_party")
+        result = nil
+
+        expect { result = subject.update_merchant_account(user: creator, paypal_merchant_id:) }.not_to raise_error
+        expect(result).to eq("Your PayPal account connect with Gumroad is incomplete because of missing permissions. Please try connecting again and grant the requested permissions.")
+      end
+
+      it "treats malformed integration and grant entries as incomplete" do
+        oauth_integrations.replace([nil, {
+                                     "integration_type" => "OAUTH_THIRD_PARTY",
+                                     "integration_method" => "PAYPAL",
+                                     "oauth_third_party" => [nil]
+                                   }])
+        result = nil
+
+        expect { result = subject.update_merchant_account(user: creator, paypal_merchant_id:) }.not_to raise_error
+        expect(result).to eq("Your PayPal account connect with Gumroad is incomplete because of missing permissions. Please try connecting again and grant the requested permissions.")
+      end
+
+      it "rejects Gumroad's grant under the wrong integration type" do
+        oauth_integrations.first["integration_type"] = "FIRST_PARTY"
+        oauth_integrations.first["oauth_third_party"] = [{ "partner_client_id" => PAYPAL_PARTNER_CLIENT_ID }]
+
+        result = subject.update_merchant_account(user: creator, paypal_merchant_id:)
+
+        expect(result).to eq("Your PayPal account connect with Gumroad is incomplete because of missing permissions. Please try connecting again and grant the requested permissions.")
+      end
+
+      it "rejects Gumroad's grant under the wrong integration method" do
+        oauth_integrations.first["integration_method"] = "BRAINTREE"
+        oauth_integrations.first["oauth_third_party"] = [{ "partner_client_id" => PAYPAL_PARTNER_CLIENT_ID }]
+
+        result = subject.update_merchant_account(user: creator, paypal_merchant_id:)
+
+        expect(result).to eq("Your PayPal account connect with Gumroad is incomplete because of missing permissions. Please try connecting again and grant the requested permissions.")
+      end
+    end
+
     describe "connecting a PayPal account whose email PayPal has permanently refused for payouts" do
       let(:creator) { create(:user) }
       let(:paypal_merchant_id) { "GSQ5PDPXZCWGW" }
@@ -349,6 +440,34 @@ describe PaypalMerchantAccountManager, :vcr do
 
       expect(old_records.count).to eq(0)
       expect(creator.merchant_account("paypal").charge_processor_merchant_id).to eq(new_paypal_merchant_id)
+    end
+  end
+
+  describe "#disconnect" do
+    it "removes products from recommendable search results when PayPal was the seller's only payout method", :elasticsearch_wait_for_refresh do
+      seller = create(:compliant_user, name: "PayPal seller", payment_address: nil)
+      product = create(:product, user: seller, taxonomy: create(:taxonomy))
+      create(:merchant_account, user: nil)
+      create(:purchase, link: product, seller:, price_cents: product.price_cents)
+      create(:merchant_account_paypal, user: seller, charge_processor_verified_at: Time.current)
+      index_model_records(Link)
+
+      recommendable_product_ids = -> {
+        Link.search(Link.search_options(ids: [product.id], include_rated_as_adult: true)).records.map(&:id)
+      }
+      expect(product.reload.recommendable?).to eq(true)
+      expect(recommendable_product_ids.call).to eq([product.id])
+
+      RefreshMerchantAccountProductsRecommendationEligibilityJob.jobs.clear
+      expect do
+        described_class.new.disconnect(user: seller)
+      end.to change(RefreshMerchantAccountProductsRecommendationEligibilityJob.jobs, :size).by(1)
+      RefreshMerchantAccountProductsRecommendationEligibilityJob.drain
+      Link.__elasticsearch__.refresh_index!
+
+      expect(product.reload.recommendable?).to eq(false)
+      expect(EsClient.get(index: Link.index_name, id: product.id).dig("_source", "is_recommendable")).to eq(false)
+      expect(recommendable_product_ids.call).to be_empty
     end
   end
 end
