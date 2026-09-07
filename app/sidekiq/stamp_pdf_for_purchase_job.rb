@@ -15,8 +15,10 @@ class StampPdfForPurchaseJob
       # Invalidate the cache after sending the email notification
       Rails.cache.delete(PdfStampingService.cache_key_for_purchase(purchase_id))
     end
-
   rescue PdfStampingService::Error => e
     Rails.logger.error("[#{self.class.name}.#{__method__}] Failed stamping for purchase #{purchase.id}: #{e.message}")
+    # The download page caches this enqueue for 4 hours; drop it so a failed stamp can be retried.
+    Rails.cache.delete(PdfStampingService.cache_key_for_purchase(purchase_id)) if notify_buyer
+    raise
   end
 end
