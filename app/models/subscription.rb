@@ -1596,7 +1596,7 @@ class Subscription < ApplicationRecord
     return true if is_installment_plan
 
     duration = original_purchase.purchase_offer_code_discount&.duration_in_billing_cycles
-    duration.blank? || purchases.successful.count < duration
+    duration.blank? || successful_billing_period_charges_count < duration
   end
 
   def cookie_key
@@ -1768,6 +1768,13 @@ class Subscription < ApplicationRecord
 
     def successful_purchases
       is_test_subscription ? purchases.test_successful : purchases.successful
+    end
+
+    # Mid-cycle upgrades are extra successful rows, not billing periods. Counting
+    # them as duration would end a limited offer after an upgrade instead of after
+    # the promised number of renewals.
+    def successful_billing_period_charges_count
+      successful_purchases.not_is_upgrade_purchase.count
     end
 
     def last_successful_not_reversed_or_refunded_charge_at
